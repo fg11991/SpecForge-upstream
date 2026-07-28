@@ -1,3 +1,4 @@
+import contextlib
 import gzip
 import json
 import tempfile
@@ -12,6 +13,7 @@ from scripts.prepare_hidden_states import (
     HiddenStatesGenerator,
     _generate_shared_vocab_mapping,
     _resolve_draft_vocab_size,
+    build_processed_dataset,
     build_target_model,
     parse_args,
     resolve_offline_capture_plan,
@@ -60,6 +62,53 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
             args.draft_model_config,
         )
         self.assertFalse(hasattr(args, "capture_layers"))
+
+    def test_cli_leaves_trainable_token_filtering_off_by_default(self):
+        base_argv = [
+            "prepare_hidden_states.py",
+            "--target-model-path",
+            "target",
+            "--data-path",
+            "data.jsonl",
+        ]
+        with mock.patch("sys.argv", base_argv):
+            default_args = parse_args()
+        with mock.patch("sys.argv", base_argv + ["--minimum-valid-tokens", "32"]):
+            filtered_args = parse_args()
+
+        self.assertIsNone(default_args.minimum_valid_tokens)
+        self.assertEqual(32, filtered_args.minimum_valid_tokens)
+
+    def test_dataset_build_forwards_the_trainable_token_threshold(self):
+        argv = [
+            "prepare_hidden_states.py",
+            "--target-model-path",
+            "target",
+            "--data-path",
+            "data.jsonl",
+            "--minimum-valid-tokens",
+            "32",
+        ]
+        with mock.patch("sys.argv", argv):
+            args = parse_args()
+
+        with (
+            mock.patch(
+                "scripts.prepare_hidden_states.rank_0_priority",
+                new=contextlib.nullcontext,
+            ),
+            mock.patch(
+                "scripts.prepare_hidden_states.build_eagle3_dataset"
+            ) as build_dataset,
+        ):
+            build_processed_dataset(
+                args, mock.sentinel.dataset, mock.sentinel.tokenizer
+            )
+
+        self.assertEqual(32, build_dataset.call_args.kwargs["minimum_valid_tokens"])
+        self.assertEqual(
+            mock.sentinel.dataset, build_dataset.call_args.kwargs["dataset"]
+        )
 
     def test_strategy_capture_plans_use_draft_owned_layers_and_schemas(self):
         expected = {

@@ -131,6 +131,18 @@ def parse_args():
     )
     data_group.add_argument("--num-samples", type=int, default=None)
     data_group.add_argument("--build-dataset-num-proc", type=int, default=8)
+    data_group.add_argument(
+        "--minimum-valid-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Drop samples whose loss mask holds fewer trainable tokens after "
+            "truncation, so prompt-only rows never reach the capture. This "
+            "counts tokens anywhere in the mask; DSpark additionally needs two "
+            "adjacent ones, which scripts/filter_trainable_conversations.py "
+            "checks on the source JSONL."
+        ),
+    )
 
     inference_group = parser.add_argument_group("inference")
     inference_group.add_argument("--tp-size", type=int, default=1)
@@ -223,6 +235,27 @@ def _resolve_draft_vocab_size(source: str) -> int:
             f"draft_vocab_size (or vocab_size fallback), got {value!r}"
         )
     return value
+
+
+def build_processed_dataset(args: argparse.Namespace, dataset, tokenizer):
+    """Tokenize the complete, un-sharded dataset once on rank 0."""
+
+    cache_params_string = f"{args.data_path}-{args.max_length}-{args.chat_template}-{args.target_model_path}-{args.num_samples}-{args.is_preformatted}"
+    cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
+
+    with rank_0_priority():
+        print_with_rank("Main process is building the dataset cache...")
+        return build_eagle3_dataset(
+            dataset=dataset,
+            tokenizer=tokenizer,
+            chat_template=args.chat_template,
+            max_length=args.max_length,
+            cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
+            cache_key=cache_key,
+            is_preformatted=args.is_preformatted,
+            num_proc=args.build_dataset_num_proc,
+            minimum_valid_tokens=args.minimum_valid_tokens,
+        )
 
 
 def _generate_shared_vocab_mapping(
@@ -832,22 +865,7 @@ def main():
     tokenizer = load_tokenizer(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
-    cache_params_string = f"{args.data_path}-{args.max_length}-{args.chat_template}-{args.target_model_path}-{args.num_samples}-{args.is_preformatted}"
-    cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
-
-    # Preprocess on complete, un-sharded dataset
-    with rank_0_priority():
-        print_with_rank("Main process is building the dataset cache...")
-        eagle3_dataset = build_eagle3_dataset(
-            dataset=dataset,
-            tokenizer=tokenizer,
-            chat_template=args.chat_template,
-            max_length=args.max_length,
-            cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
-            cache_key=cache_key,
-            is_preformatted=args.is_preformatted,
-            num_proc=args.build_dataset_num_proc,
-        )
+    eagle3_dataset = build_processed_dataset(args, dataset, tokenizer)
     print_with_rank(f"Dataset prepared with {len(eagle3_dataset)} samples.")
 
     vocab_mapping_path = _generate_shared_vocab_mapping(

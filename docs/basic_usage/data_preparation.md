@@ -258,10 +258,39 @@ specforge train --config ./my-eagle3-disaggregated.yaml
 ## 💾 Prepare offline target features
 
 Offline EAGLE3, DFlash, Domino, and DSpark runs consume target features created
-by `scripts/prepare_hidden_states.py`. Select the same strategy and draft
-configuration that the later training recipe uses; these values determine both
-the target layers captured and the checkpoint schema. For example, prepare the
-checked-in Qwen3-8B DFlash recipe with:
+by `scripts/prepare_hidden_states.py`.
+
+Long prompts can consume the entire sequence limit before the first assistant
+token, leaving an all-zero loss mask that only fails much later, during
+training. Filter the source JSONL with the same target tokenizer, chat
+template, and maximum length before doing the expensive hidden-state capture:
+
+```bash
+python scripts/filter_trainable_conversations.py \
+    --input-path ./cache/dataset/sharegpt_train.jsonl \
+    --output-path ./cache/dataset/sharegpt_train_2048.jsonl \
+    --tokenizer-path Qwen/Qwen3-4B \
+    --chat-template qwen \
+    --max-length 2048
+```
+
+The default requires two consecutive trainable tokens after truncation and
+after excluding the final sequence position, matching DSpark's anchor
+requirement. Use the filtered file as `prepare_hidden_states.py --data-path`.
+The script preserves accepted JSONL rows unchanged and refuses to overwrite an
+existing output. For a non-DSpark workflow that only requires a nonempty loss
+mask, pass `--min-consecutive-loss-tokens 1`.
+
+As a backstop, `prepare_hidden_states.py --minimum-valid-tokens N` drops
+samples holding fewer than `N` trainable tokens instead of writing them to
+disk. That check counts tokens anywhere in the mask rather than adjacent pairs,
+so it complements the filter above rather than replacing it. DFlash-family
+online training already applies `2 * block_size` here, which is a reasonable
+value for the offline path too.
+
+Select the same strategy and draft configuration that the later training recipe
+uses; these values determine both the target layers captured and the checkpoint
+schema. For example, prepare the checked-in Qwen3-8B DFlash recipe with:
 
 ```bash
 torchrun --nproc_per_node=8 \
