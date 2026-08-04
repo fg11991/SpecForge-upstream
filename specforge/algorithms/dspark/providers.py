@@ -50,6 +50,11 @@ def resume_contract(_config, draft_model, training_model):
 
     return {
         "dspark_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
+        # A resume that silently changed the pruned vocabulary would keep
+        # training a head whose rows no longer mean what they did before.
+        "dspark_draft_vocab_size": int(
+            getattr(draft_model, "draft_vocab_size", draft_model.config.vocab_size)
+        ),
         "dspark_target_layer_ids": tuple(
             int(layer_id) for layer_id in draft_model.target_layer_ids
         ),
@@ -138,6 +143,7 @@ def algorithm_spec() -> AlgorithmSpec:
         ),
         capabilities=AlgorithmCapabilities(
             attention_backends={"eager", "sdpa", "flex_attention"},
+            supports_vocab_mapping=True,
         ),
     )
 
@@ -198,6 +204,7 @@ def algorithm_providers() -> AlgorithmProviders:
                 build_collator=build_dspark_collator,
             ),
         ),
+        vocab_mapping_modes=frozenset({FeatureMode.OFFLINE, FeatureMode.STREAMING}),
     )
 
 

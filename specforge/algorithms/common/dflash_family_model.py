@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from specforge.core.chunking import checkpointed_chunk_reduce
 from specforge.modeling.draft.dflash import DFlashDraftModel
+from specforge.modeling.draft.vocab_mixin import OUT_OF_DRAFT_VOCAB_LABEL
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -148,6 +149,10 @@ class OnlineDFlashModel(nn.Module):
         self.draft_model = draft_model
         self.lm_head = target_lm_head
         self.embed_tokens = target_embed_tokens
+        self.use_draft_vocab = bool(getattr(draft_model, "use_draft_vocab", False))
+        # (version, pruned_head_weight, target->draft label index); see
+        # _pruned_head_state for why this cannot be built in __init__.
+        self._pruned_head_cache: Optional[Tuple[int, torch.Tensor, torch.Tensor]] = None
         self.block_size = block_size
         self.mask_token_id = mask_token_id
         self.attention_backend = attention_backend
@@ -160,6 +165,42 @@ class OnlineDFlashModel(nn.Module):
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
         self._cached_bsz: Optional[int] = None
+
+    def _pruned_head_state(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(head_weight[K, H], label_index[V])`` for the pruned vocab.
+
+        Built on first use rather than in ``__init__``: the training model is
+        constructed in ``build_model_bundle`` but the t2d/d2t mapping is only
+        installed afterwards (``_ensure_offline_vocab_mapping``, or an explicit
+        ``model.vocab_mapping_path``). Keying the cache on the draft model's
+        ``vocab_mapping_version`` makes a later re-install take effect instead of
+        silently serving a stale slice.
+        """
+        draft = self.draft_model
+        version = int(getattr(draft, "vocab_mapping_version", 0))
+        cache = self._pruned_head_cache
+        if cache is not None and cache[0] == version:
+            return cache[1], cache[2]
+        draft.require_vocab_mapping()
+        weight = self.lm_head.weight
+        mask = draft.t2d.to(device=weight.device, dtype=torch.bool)
+        # Row-slicing keeps the same order as column-slicing the full logits, so
+        # draft index i corresponds to target id nonzero(t2d)[i] on both sides.
+        pruned_weight = weight[mask].contiguous()
+        label_index = draft.draft_vocab_index().to(device=weight.device)
+        self._pruned_head_cache = (version, pruned_weight, label_index)
+        return pruned_weight, label_index
+
+    def apply_objective_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project hidden states onto the vocabulary this objective supervises.
+
+        Unpruned runs call the head module itself, which keeps any head that is
+        not a plain ``nn.Linear`` working. Only pruning needs the raw rows.
+        """
+        if not self.use_draft_vocab:
+            return self.lm_head(hidden_states)
+        weight = self._pruned_head_state()[0]
+        return F.linear(hidden_states.to(weight.dtype), weight)
 
     def _sample_anchor_positions(
         self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
@@ -886,13 +927,21 @@ class OnlineDSparkModel(OnlineDFlashModel):
         prev_token_ids: torch.Tensor,
         target_ids: torch.Tensor,
         loss_weights: torch.Tensor,
+        ce_weights: torch.Tensor,
         eval_mask: torch.Tensor,
         aligned_target_hidden: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, ...]:
-        """Return additive loss and telemetry numerators for one block slice."""
+        """Return additive loss and telemetry numerators for one block slice.
+
+        ``target_ids`` are labels in the objective's own vocabulary: real target
+        ids for a full-vocabulary draft, draft ids (with
+        ``OUT_OF_DRAFT_VOCAB_LABEL`` for pruned tokens) when the vocab is pruned.
+        ``prev_token_ids`` are always real target ids -- they index the Markov
+        head's W1, which spans the full target vocabulary either way.
+        """
 
         batch_size, num_blocks, block_size, hidden_size = hidden.shape
-        base_logits = self.lm_head(
+        base_logits = self.apply_objective_head(
             hidden.reshape(batch_size, num_blocks * block_size, hidden_size)
         ).reshape(batch_size, num_blocks, block_size, -1)
         draft_logits = self.draft_model.apply_logits_head(
@@ -901,12 +950,15 @@ class OnlineDSparkModel(OnlineDFlashModel):
             hidden_states=hidden,
         )
         vocab_size = draft_logits.shape[-1]
+        # ignore_index zeroes the pruned-label positions; ce_weights zeroes the
+        # matching entries so they leave the CE denominator too.
         cross_entropy = F.cross_entropy(
             draft_logits.reshape(-1, vocab_size),
             target_ids.reshape(-1),
             reduction="none",
+            ignore_index=OUT_OF_DRAFT_VOCAB_LABEL,
         ).reshape_as(target_ids)
-        ce_num = (cross_entropy * loss_weights).sum()
+        ce_num = (cross_entropy * ce_weights).sum()
 
         zero = ce_num.new_zeros(())
         l1_num = zero
@@ -923,7 +975,11 @@ class OnlineDSparkModel(OnlineDFlashModel):
         teacher_ids = None
         if aligned_target_hidden is not None:
             with torch.no_grad():
-                target_logits = self.lm_head(
+                # The teacher must use the SAME head rows as the student: that is
+                # what turns the pruned objective into a match against the target
+                # distribution renormalized over the kept tokens, rather than a
+                # match against a truncated (sub-normalized) one.
+                target_logits = self.apply_objective_head(
                     aligned_target_hidden.reshape(
                         batch_size,
                         num_blocks * block_size,
@@ -962,10 +1018,19 @@ class OnlineDSparkModel(OnlineDFlashModel):
 
         with torch.no_grad():
             predicted_ids = draft_logits.argmax(dim=-1)
+            # A pruned label is OUT_OF_DRAFT_VOCAB_LABEL, which no predicted id
+            # can equal, so it counts as a miss -- exactly what serving does with
+            # a token the draft cannot propose. Accuracy therefore reports the
+            # real acceptance ceiling instead of hiding the pruning loss.
             correct = ((predicted_ids == target_ids) & eval_mask).float()
             correct_num = correct.sum()
             eval_den = eval_mask.float().sum()
-            ce_position_num = (cross_entropy.detach() * eval_mask).sum(dim=(0, 1))
+            # Cross-entropy is undefined at pruned labels, so its telemetry uses
+            # the in-vocabulary subset; accuracy keeps the full eval set.
+            ce_eval_mask = eval_mask & (target_ids >= 0)
+            ce_eval_den = ce_eval_mask.float().sum()
+            ce_position_num = (cross_entropy.detach() * ce_eval_mask).sum(dim=(0, 1))
+            ce_position_den = ce_eval_mask.float().sum(dim=(0, 1))
             correct_position_num = correct.sum(dim=(0, 1))
             position_den = eval_mask.float().sum(dim=(0, 1))
             if aligned_target_hidden is not None:
@@ -993,7 +1058,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
             confidence_error_num,
             correct_num,
             eval_den,
+            ce_eval_den,
             ce_position_num,
+            ce_position_den,
             correct_position_num,
             position_den,
             teacher_agreement_num,
@@ -1024,6 +1091,20 @@ class OnlineDSparkModel(OnlineDFlashModel):
         )
         loss_weights = self._dspark_loss_weight_mask(eval_mask)
         local_loss_den = loss_weights.sum()
+        # A pruned vocabulary splits the objective in two. The L1 and confidence
+        # terms compare distributions and stay well defined at every supervised
+        # position. Cross-entropy needs a realizable label, so it drops the
+        # positions whose true token was pruned away -- and must drop them from
+        # its denominator too, or alpha_ce would silently scale with coverage.
+        objective_target_ids = target_ids
+        ce_weights = loss_weights
+        if self.use_draft_vocab:
+            label_index = self._pruned_head_state()[1]
+            objective_target_ids = label_index[target_ids]
+            ce_weights = loss_weights * (objective_target_ids >= 0).to(
+                loss_weights.dtype
+            )
+        local_ce_den = ce_weights.sum()
         need_target = self.dspark_l1_loss_alpha > 0 or (
             self.dspark_confidence_head_alpha > 0
             and getattr(self.draft_model, "confidence_head", None) is not None
@@ -1043,8 +1124,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
             self._dspark_objective_chunk_terms,
             hidden_4d,
             prev_token_ids,
-            target_ids,
+            objective_target_ids,
             loss_weights,
+            ce_weights,
             eval_mask,
             aligned_target_hidden,
             chunk_size=self.objective_chunk_blocks,
@@ -1058,7 +1140,9 @@ class OnlineDSparkModel(OnlineDFlashModel):
             confidence_error_num,
             correct_num,
             eval_den,
+            ce_eval_den,
             ce_position_num,
+            ce_position_den,
             correct_position_num,
             position_den,
             teacher_agreement_num,
@@ -1069,6 +1153,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         ) = totals
 
         global_loss_den = local_loss_den.detach().clone()
+        global_ce_den = local_ce_den.detach().clone()
         world_size = 1
         import torch.distributed as dist
 
@@ -1076,13 +1161,26 @@ class OnlineDSparkModel(OnlineDFlashModel):
             world_size = dist.get_world_size()
             if world_size > 1:
                 dist.all_reduce(global_loss_den, op=dist.ReduceOp.SUM)
+                dist.all_reduce(global_ce_den, op=dist.ReduceOp.SUM)
         if float(global_loss_den) <= 0:
             raise ValueError("DSpark objective has no supervised target tokens")
-        loss = (
-            world_size
-            * (
-                self.dspark_ce_loss_alpha * ce_num
-                + self.dspark_l1_loss_alpha * l1_num
+        if self.dspark_ce_loss_alpha > 0 and float(global_ce_den) <= 0:
+            raise ValueError(
+                "DSpark cross-entropy has no in-vocabulary target tokens; the "
+                "draft vocabulary covers none of this batch"
+            )
+        # Each term is a weighted mean over the positions it is defined on. When
+        # the vocabulary is not pruned global_ce_den == global_loss_den and this
+        # is algebraically the single-denominator form it replaces.
+        ce_term = (
+            self.dspark_ce_loss_alpha * ce_num / global_ce_den
+            if self.dspark_ce_loss_alpha > 0
+            else ce_num * 0.0
+        )
+        loss = world_size * (
+            ce_term
+            + (
+                self.dspark_l1_loss_alpha * l1_num
                 + self.dspark_confidence_head_alpha * confidence_num
             )
             / global_loss_den
@@ -1090,7 +1188,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
 
         ratio_metrics = {
             "acc": (correct_num, eval_den),
-            "ce_loss": (ce_num.detach(), local_loss_den.detach()),
+            "ce_loss": (ce_num.detach(), local_ce_den.detach()),
             "l1_loss": (l1_num.detach(), local_loss_den.detach()),
             "confidence_loss": (
                 confidence_num.detach(),
@@ -1100,9 +1198,14 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 confidence_error_num.detach(),
                 local_loss_den.detach(),
             ),
-            "ce_position": (ce_position_num, position_den),
+            "ce_position": (ce_position_num, ce_position_den),
             "accuracy_position": (correct_position_num, position_den),
         }
+        if self.use_draft_vocab:
+            # Share of supervised tokens the pruned vocabulary can actually
+            # propose. This is the hard ceiling on acceptance, so it belongs in
+            # the training log rather than in a post-hoc audit.
+            ratio_metrics["draft_vocab_coverage"] = (ce_eval_den, eval_den)
         if aligned_target_hidden is not None:
             ratio_metrics.update(
                 {

@@ -169,15 +169,52 @@ def _validate_training_topology(
         raise ValueError("USP attention currently requires offline features")
 
 
+def _prunes_vocabulary(cfg: Config, algorithm: AlgorithmRegistration) -> bool:
+    """Whether this run's draft actually predicts over a pruned vocabulary.
+
+    Declaring ``supports_vocab_mapping`` says the algorithm *can* prune; only
+    ``draft_vocab_size < vocab_size`` in the resolved draft config says this run
+    *does*. Mapping requirements must key off the latter, or turning the
+    capability on would start rejecting full-vocabulary configs that never
+    needed a mapping.
+    """
+    if not algorithm.spec.capabilities.supports_vocab_mapping:
+        return False
+
+    from specforge.training.model_loading import draft_config_dict
+
+    try:
+        draft_cfg = draft_config_dict(
+            cfg, provider=algorithm.providers.model.draft_config
+        )
+    except Exception:
+        # Resolving the draft config is not this check's job to get right. When
+        # it cannot be read, keep the stricter pre-existing behaviour and demand
+        # the mapping; assembly reports the real resolution error moments later.
+        return True
+    vocab_size = draft_cfg.get("vocab_size")
+    draft_vocab_size = draft_cfg.get("draft_vocab_size") or vocab_size
+    if vocab_size is None or draft_vocab_size is None:
+        return False
+    return int(draft_vocab_size) != int(vocab_size)
+
+
 def _validate_vocab_mapping(
     cfg: Config,
     algorithm: AlgorithmRegistration,
     mode: FeatureMode,
 ) -> None:
+    supports_mapping = algorithm.spec.capabilities.supports_vocab_mapping
+    if cfg.model.vocab_mapping_path and not supports_mapping:
+        raise ValueError(
+            f"algorithm {algorithm.name!r} does not support vocabulary mapping, "
+            "so model.vocab_mapping_path would be silently ignored; remove it"
+        )
     if (
         cfg.deployment.mode == "disaggregated"
         and mode in algorithm.providers.vocab_mapping_modes
         and not cfg.model.vocab_mapping_path
+        and _prunes_vocabulary(cfg, algorithm)
     ):
         raise ValueError(
             f"algorithm {algorithm.name!r} disaggregated runs require "
