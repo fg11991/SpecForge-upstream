@@ -104,6 +104,136 @@ def _mapping(draft_vocab_size=DRAFT_VOCAB_SIZE):
     return t2d, d2t
 
 
+#: Names for ``_dspark_objective_chunk_terms``'s positional return, so the
+#: reference below can be compared by meaning instead of by index.
+_TERM_NAMES = (
+    "ce_num",
+    "l1_num",
+    "confidence_num",
+    "confidence_error_num",
+    "correct_num",
+    "eval_den",
+    "ce_eval_den",
+    "ce_position_num",
+    "ce_position_den",
+    "correct_position_num",
+    "position_den",
+    "teacher_agreement_num",
+    "teacher_top1_num",
+    "draft_top1_num",
+    "tau_num",
+    "tau_den",
+)
+
+
+def _chunk_term_args(model, blocks=4, seed=11):
+    """Build one chunk's worth of objective inputs, shaped as the forward does."""
+    torch.manual_seed(seed)
+    hidden = torch.randn(1, blocks, BLOCK, HIDDEN)
+    prev_token_ids = torch.randint(0, VOCAB_SIZE, (1, blocks, BLOCK))
+    target_ids = torch.randint(0, VOCAB_SIZE, (1, blocks, BLOCK))
+    # eval_mask is a per-block prefix mask in the real forward (cumprod), so
+    # reproduce that shape of truth rather than an arbitrary boolean field.
+    keep = torch.tensor([[[1, 1, 1, 1], [1, 1, 1, 0], [1, 1, 0, 0], [1, 0, 0, 0]]])
+    eval_mask = keep[:, :blocks].bool()
+    loss_weights = eval_mask.to(torch.float32)
+    aligned_target_hidden = torch.randn(1, blocks, BLOCK, HIDDEN)
+    return (
+        hidden,
+        prev_token_ids,
+        target_ids,
+        loss_weights,
+        eval_mask,
+        aligned_target_hidden,
+    )
+
+
+def _reference_dspark_chunk_terms(
+    model,
+    hidden,
+    prev_token_ids,
+    target_ids,
+    loss_weights,
+    eval_mask,
+    aligned_target_hidden,
+):
+    """The DSpark objective exactly as it stood at 7712377, before pruning.
+
+    Transcribed rather than imported on purpose: a reference that is generated
+    from the implementation cannot detect a change in the implementation. Keep
+    this function frozen -- if a deliberate change to the unpruned objective is
+    ever made, the right move is to update it in the same commit and say so,
+    not to relax the comparison.
+    """
+    batch_size, num_blocks, block_size, hidden_size = hidden.shape
+    base_logits = model.lm_head(
+        hidden.reshape(batch_size, num_blocks * block_size, hidden_size)
+    ).reshape(batch_size, num_blocks, block_size, -1)
+    draft_logits = model.draft_model.apply_logits_head(
+        base_logits,
+        prev_token_ids=prev_token_ids,
+        hidden_states=hidden,
+    )
+    vocab_size = draft_logits.shape[-1]
+    cross_entropy = torch.nn.functional.cross_entropy(
+        draft_logits.reshape(-1, vocab_size),
+        target_ids.reshape(-1),
+        reduction="none",
+    ).reshape_as(target_ids)
+    terms = {"ce_num": (cross_entropy * loss_weights).sum()}
+
+    with torch.no_grad():
+        target_logits = model.lm_head(
+            aligned_target_hidden.reshape(
+                batch_size, num_blocks * block_size, hidden_size
+            )
+        ).reshape_as(draft_logits)
+        target_probabilities = torch.softmax(target_logits.float(), dim=-1)
+        teacher_ids = target_logits.argmax(dim=-1)
+    draft_probabilities = torch.softmax(draft_logits.float(), dim=-1)
+    l1_per_token = (draft_probabilities - target_probabilities).abs().sum(dim=-1)
+    accept_probability = (1.0 - 0.5 * l1_per_token).clamp(0.0, 1.0)
+    terms["l1_num"] = (l1_per_token * loss_weights).sum()
+
+    confidence_pred = model.draft_model.predict_confidence(
+        hidden, prev_token_ids=prev_token_ids
+    )
+    confidence_per_token = torch.nn.functional.binary_cross_entropy_with_logits(
+        confidence_pred.float(),
+        accept_probability.detach(),
+        reduction="none",
+    )
+    terms["confidence_num"] = (confidence_per_token * loss_weights).sum()
+    terms["confidence_error_num"] = (
+        (confidence_pred.float().sigmoid() - accept_probability).abs() * loss_weights
+    ).sum()
+
+    with torch.no_grad():
+        predicted_ids = draft_logits.argmax(dim=-1)
+        correct = ((predicted_ids == target_ids) & eval_mask).float()
+        terms["correct_num"] = correct.sum()
+        terms["eval_den"] = eval_mask.float().sum()
+        terms["ce_position_num"] = (cross_entropy.detach() * eval_mask).sum(dim=(0, 1))
+        terms["correct_position_num"] = correct.sum(dim=(0, 1))
+        terms["position_den"] = eval_mask.float().sum(dim=(0, 1))
+        terms["teacher_agreement_num"] = (
+            (predicted_ids == teacher_ids).float() * eval_mask
+        ).sum()
+        terms["teacher_top1_num"] = (
+            target_probabilities.max(dim=-1).values * eval_mask
+        ).sum()
+        terms["draft_top1_num"] = (
+            draft_probabilities.max(dim=-1).values * eval_mask
+        ).sum()
+        valid_blocks = eval_mask.any(dim=-1).float()
+        accepted_expectation = (accept_probability.detach() * eval_mask).cumprod(
+            dim=-1
+        ).sum(dim=-1) + 1.0
+        terms["tau_num"] = (accepted_expectation * valid_blocks).sum()
+        terms["tau_den"] = valid_blocks.sum()
+    return terms
+
+
 class DSparkDraftVocabTest(unittest.TestCase):
     def test_full_vocab_draft_keeps_an_unchanged_state_dict(self):
         """Existing checkpoints must stay loadable: no new keys when unpruned."""
@@ -134,19 +264,72 @@ class DSparkDraftVocabTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no t2d/d2t"):
             model(**_inputs())
 
-    def test_identity_vocab_reproduces_the_unpruned_objective(self):
-        """A draft_vocab_size equal to vocab_size must not perturb the loss."""
-        _draft_a, model_a = _build(VOCAB_SIZE, seed=1)
-        _draft_b, model_b = _build(VOCAB_SIZE, seed=1)
-        batch = _inputs()
+    def test_full_vocab_objective_matches_the_pre_pruning_formula(self):
+        """Pin the unpruned objective against the formula it had before pruning.
 
-        torch.manual_seed(42)
-        loss_a, acc_a, _ = model_a(**batch)
-        torch.manual_seed(42)
-        loss_b, acc_b, _ = model_b(**batch)
+        Comparing two runs of the *current* implementation would only prove
+        determinism -- a regression that moved both sides equally would still
+        pass. ``_reference_dspark_chunk_terms`` is a transcription of the
+        objective at 7712377, so it cannot drift along with the code under test.
+        """
+        _draft, model = _build(VOCAB_SIZE, seed=1)
+        args = _chunk_term_args(model)
 
-        self.assertTrue(torch.allclose(loss_a, loss_b))
-        self.assertTrue(torch.allclose(acc_a, acc_b))
+        expected = _reference_dspark_chunk_terms(model, *args)
+        # The current signature splits CE weights out of the shared weights; for
+        # a full-vocabulary run the two are the same tensor by construction.
+        hidden, prev_token_ids, target_ids, loss_weights, eval_mask, teacher = args
+        actual = dict(
+            zip(
+                _TERM_NAMES,
+                model._dspark_objective_chunk_terms(
+                    hidden,
+                    prev_token_ids,
+                    target_ids,
+                    loss_weights,
+                    loss_weights,
+                    eval_mask,
+                    teacher,
+                ),
+            )
+        )
+
+        self.assertEqual(len(actual), len(_TERM_NAMES))
+        self.assertTrue(set(expected) <= set(actual))
+        for name, want in expected.items():
+            with self.subTest(term=name):
+                # Bit-exact: the claim is that the unpruned path is the same
+                # arithmetic, not merely a close approximation of it.
+                self.assertTrue(
+                    torch.equal(actual[name], want),
+                    f"{name}: {actual[name]} != {want}",
+                )
+
+    def test_full_vocab_coverage_terms_are_degenerate(self):
+        """The two terms pruning added must be no-ops without pruning."""
+        _draft, model = _build(VOCAB_SIZE, seed=1)
+        hidden, prev_token_ids, target_ids, loss_weights, eval_mask, teacher = (
+            _chunk_term_args(model)
+        )
+
+        terms = model._dspark_objective_chunk_terms(
+            hidden,
+            prev_token_ids,
+            target_ids,
+            loss_weights,
+            loss_weights,
+            eval_mask,
+            teacher,
+        )
+        named = dict(zip(_TERM_NAMES, terms))
+        ce_eval_den = named["ce_eval_den"]
+        ce_position_den = named["ce_position_den"]
+
+        # Every label is in vocabulary, so the CE evaluation set is the full one.
+        self.assertTrue(torch.equal(ce_eval_den, eval_mask.float().sum()))
+        self.assertTrue(
+            torch.equal(ce_position_den, eval_mask.float().sum(dim=(0, 1)))
+        )
 
     def test_pruned_objective_trains_and_reports_coverage(self):
         pruned, model = _build(DRAFT_VOCAB_SIZE)
@@ -228,6 +411,58 @@ class DSparkDraftVocabTest(unittest.TestCase):
 
         self.assertFalse(torch.equal(first, second))
 
+    def test_mapping_survives_a_state_dict_round_trip(self):
+        """A reloaded pruned checkpoint must be runnable, not just byte-correct.
+
+        t2d/d2t travel in the state dict, but load_state_dict calls none of our
+        methods; if "is a mapping installed" were tracked as a flag, a correctly
+        saved checkpoint would reload and then refuse to run.
+        """
+        source, _model = _build(DRAFT_VOCAB_SIZE)
+        t2d, d2t = _mapping()
+        source.install_vocab_mapping(t2d, d2t)
+
+        target, target_model = _build(DRAFT_VOCAB_SIZE, seed=7)
+        self.assertFalse(target.vocab_mapping_loaded)
+        target.load_state_dict(source.state_dict())
+
+        self.assertTrue(target.vocab_mapping_loaded)
+        self.assertTrue(torch.equal(target.t2d, source.t2d))
+        self.assertTrue(torch.equal(target.d2t, source.d2t))
+        self.assertTrue(
+            torch.equal(target.draft_vocab_index(), source.draft_vocab_index())
+        )
+        target_model(**_inputs())
+
+    def test_state_dict_load_invalidates_a_head_built_from_the_old_mapping(self):
+        """Loading over a model that already ran must not reuse the old slice."""
+        first_draft, model = _build(DRAFT_VOCAB_SIZE)
+        t2d, d2t = _mapping()
+        first_draft.install_vocab_mapping(t2d, d2t)
+        before = model._pruned_head_state()[0].clone()
+
+        other = Counter({token: token + 1 for token in range(VOCAB_SIZE)})
+        other_d2t, other_t2d = process_token_dict_to_mappings(
+            other, DRAFT_VOCAB_SIZE, VOCAB_SIZE
+        )
+        donor, _ = _build(DRAFT_VOCAB_SIZE, seed=7)
+        donor.install_vocab_mapping(other_t2d, other_d2t)
+        first_draft.load_state_dict(donor.state_dict())
+
+        self.assertFalse(torch.equal(before, model._pruned_head_state()[0]))
+
+    def test_draft_vocab_size_rejects_degenerate_values(self):
+        """0 must not be coerced to "full vocabulary" behind the user's back."""
+        for bad in (0, -1, True, 2.5, VOCAB_SIZE + 1):
+            with self.subTest(draft_vocab_size=bad):
+                with self.assertRaises(ValueError):
+                    DSparkDraftModel(_draft_config(bad))
+
+        # None remains the only spelling of "unset".
+        unset = DSparkDraftModel(_draft_config(None))
+        self.assertEqual(unset.draft_vocab_size, VOCAB_SIZE)
+        self.assertFalse(unset.use_draft_vocab)
+
 
 class DSparkVocabMappingPlanningTest(unittest.TestCase):
     """Requiring an explicit mapping must key off pruning, not capability."""
@@ -266,6 +501,19 @@ class DSparkVocabMappingPlanningTest(unittest.TestCase):
         cfg = self._config("configs/qwen3-8b-dspark-draftvocab32k.json")
         self.assertTrue(_prunes_vocabulary(cfg, self.ALGORITHM))
         with self.assertRaisesRegex(ValueError, "vocab_mapping_path"):
+            _validate_vocab_mapping(cfg, self.ALGORITHM, FeatureMode.STREAMING)
+
+    def test_mapping_path_on_a_full_vocab_run_is_rejected(self):
+        """Capability is not use: a full-vocab run has nothing to map.
+
+        Without this the path is accepted here and then fails deep in model
+        construction with an error about missing t2d/d2t buffers, which points
+        at the model instead of at the config that is actually wrong.
+        """
+        cfg = self._config(
+            "configs/qwen3-8b-dspark.json", vocab_mapping_path="mapping.pt"
+        )
+        with self.assertRaisesRegex(ValueError, "no t2d/d2t buffers"):
             _validate_vocab_mapping(cfg, self.ALGORITHM, FeatureMode.STREAMING)
 
     def test_mapping_path_on_an_incapable_algorithm_is_rejected(self):

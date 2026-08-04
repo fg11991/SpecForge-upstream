@@ -210,6 +210,25 @@ def _validate_vocab_mapping(
             f"algorithm {algorithm.name!r} does not support vocabulary mapping, "
             "so model.vocab_mapping_path would be silently ignored; remove it"
         )
+    # Supporting mapping is not the same as being able to consume one. A draft
+    # that only registers t2d/d2t when it prunes cannot load a mapping at full
+    # vocabulary, and without this the path is accepted here and then fails much
+    # later with a "t2d/d2t buffers are not present" error that points at the
+    # model instead of at the config. Drafts that always carry the buffers just
+    # install an identity map, which is redundant but works, so they are left
+    # alone rather than having a shipped config invalidated retroactively.
+    if (
+        cfg.model.vocab_mapping_path
+        and supports_mapping
+        and not algorithm.spec.capabilities.keeps_vocab_buffers_when_unpruned
+        and not _prunes_vocabulary(cfg, algorithm)
+    ):
+        raise ValueError(
+            f"algorithm {algorithm.name!r} run has draft_vocab_size == "
+            "vocab_size, so its draft carries no t2d/d2t buffers for "
+            "model.vocab_mapping_path to load into; set a smaller "
+            "draft_vocab_size in the draft config or remove the path"
+        )
     if (
         cfg.deployment.mode == "disaggregated"
         and mode in algorithm.providers.vocab_mapping_modes

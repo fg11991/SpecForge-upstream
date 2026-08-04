@@ -715,6 +715,7 @@ class TestPackageArchitecture(unittest.TestCase):
                 "inkling-dspark.json",
                 "qwen3-4b-dspark.json",
                 "qwen3-8b-dspark.json",
+                "qwen3-8b-dspark-draftvocab32k.json",
                 "qwen3.6-27b-dspark.json",
             },
         )

@@ -41,6 +41,7 @@ EXPECTED_NPROC_PER_NODE = {
     "qwen3-4b-dspark-offline.yaml": 1,
     "qwen3-4b-dspark-disaggregated.yaml": 1,
     "qwen3-4b-eagle3-online.yaml": 1,
+    "qwen3-8b-dspark-draftvocab32k-offline.yaml": 1,
     "qwen3-8b-dspark-offline.yaml": 1,
     "qwen3-8b-dflash-disaggregated.yaml": 4,
     "qwen3-8b-dflash-1server-dp7-disaggregated.yaml": 7,
@@ -312,7 +313,7 @@ def _recipes() -> dict[str, Path]:
 class ExampleLaunchTopologyTest(unittest.TestCase):
     def test_every_recipe_has_the_explicit_golden_topology(self):
         recipes = _recipes()
-        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 63)
+        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 64)
         self.assertEqual(set(recipes), set(EXPECTED_NPROC_PER_NODE))
 
         for filename, nproc_per_node in EXPECTED_NPROC_PER_NODE.items():

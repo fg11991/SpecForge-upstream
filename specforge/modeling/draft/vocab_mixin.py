@@ -37,6 +37,17 @@ import torch
 OUT_OF_DRAFT_VOCAB_LABEL = -100
 
 
+def _invalidate_vocab_mapping_derivations(module, _incompatible_keys) -> None:
+    """Bump the mapping version and drop everything derived from the buffers.
+
+    Registered as a ``load_state_dict`` post hook and called directly by
+    :meth:`DraftVocabMappingMixin.install_vocab_mapping`, so both routes into the
+    buffers converge on one invalidation point.
+    """
+    module.vocab_mapping_version = int(getattr(module, "vocab_mapping_version", 0)) + 1
+    module._draft_vocab_index = None
+
+
 class DraftVocabMappingMixin:
     """``t2d``/``d2t`` ownership for drafts that prune the target vocabulary.
 
@@ -45,9 +56,25 @@ class DraftVocabMappingMixin:
     owns installation, validation, and the derived lookup table.
     """
 
-    #: Bumped on every successful install so lazy consumers can invalidate.
+    #: Bumped whenever the buffers change so lazy consumers can invalidate.
     vocab_mapping_version: int = 0
-    vocab_mapping_loaded: bool = False
+
+    @property
+    def vocab_mapping_loaded(self) -> bool:
+        """Whether a usable mapping is present, derived from the buffer itself.
+
+        Deliberately not a flag set by :meth:`install_vocab_mapping`: buffers
+        also arrive through ``load_state_dict`` and ``from_pretrained``, which
+        call no method of ours.  A flag would leave a correctly reloaded
+        checkpoint reporting "not installed" and refusing to run.  The empty
+        ``t2d`` that :meth:`register_draft_vocab_buffers` starts from is the
+        unambiguous "nothing installed yet" state, since a real mapping always
+        selects exactly ``draft_vocab_size`` tokens.
+        """
+        if not getattr(self, "use_draft_vocab", False):
+            return True
+        t2d = getattr(self, "t2d", None)
+        return t2d is not None and bool(t2d.any())
 
     def register_draft_vocab_buffers(
         self,
@@ -64,7 +91,17 @@ class DraftVocabMappingMixin:
         byte-for-byte.
         """
         vocab_size = int(vocab_size)
-        draft_vocab_size = int(draft_vocab_size or vocab_size)
+        # Only None means "unset". Coercing with ``or`` would turn an explicit 0
+        # into the full vocabulary and make the check below unreachable, while
+        # build_model_bundle kept reading the literal 0 out of the config -- the
+        # same setting meaning two different things in two places.
+        if draft_vocab_size is None:
+            draft_vocab_size = vocab_size
+        if isinstance(draft_vocab_size, bool) or not isinstance(draft_vocab_size, int):
+            raise ValueError(
+                "draft_vocab_size must be an integer or None, got "
+                f"{draft_vocab_size!r}"
+            )
         if draft_vocab_size <= 0:
             raise ValueError(f"draft_vocab_size must be > 0, got {draft_vocab_size}")
         if draft_vocab_size > vocab_size:
@@ -75,11 +112,15 @@ class DraftVocabMappingMixin:
         self.vocab_size = vocab_size
         self.draft_vocab_size = draft_vocab_size
         self.use_draft_vocab = draft_vocab_size != vocab_size
-        # A full-vocabulary draft needs no mapping, so it starts out satisfied.
-        self.vocab_mapping_loaded = not self.use_draft_vocab
         if self.use_draft_vocab:
             self.register_buffer("t2d", torch.zeros(vocab_size, dtype=torch.bool))
             self.register_buffer("d2t", torch.zeros(draft_vocab_size, dtype=torch.long))
+            # load_state_dict writes the buffers behind our back, so anything
+            # derived from them (the row-sliced head, the label lookup) has to be
+            # invalidated here or a resumed run keeps using the previous slice.
+            self.register_load_state_dict_post_hook(
+                _invalidate_vocab_mapping_derivations
+            )
 
     def install_vocab_mapping(self, t2d: torch.Tensor, d2t: torch.Tensor) -> None:
         """Validate one mapping and copy it into the buffers.
@@ -108,9 +149,7 @@ class DraftVocabMappingMixin:
         validate_vocab_mapping_consistency(t2d, d2t)
         self.t2d.copy_(t2d)
         self.d2t.copy_(d2t)
-        self.vocab_mapping_loaded = True
-        self.vocab_mapping_version = int(self.vocab_mapping_version) + 1
-        self._draft_vocab_index = None
+        _invalidate_vocab_mapping_derivations(self, None)
 
     def load_vocab_mapping(self, file_path: str) -> None:
         """Load and install the ``{"t2d", "d2t"}`` tensor file at ``file_path``."""

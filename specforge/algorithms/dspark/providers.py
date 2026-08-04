@@ -144,6 +144,9 @@ def algorithm_spec() -> AlgorithmSpec:
         capabilities=AlgorithmCapabilities(
             attention_backends={"eager", "sdpa", "flex_attention"},
             supports_vocab_mapping=True,
+            # DFlash-family drafts register t2d/d2t only when they prune, so an
+            # unpruned run has nowhere to put a mapping. See _validate_vocab_mapping.
+            keeps_vocab_buffers_when_unpruned=False,
         ),
     )
 
