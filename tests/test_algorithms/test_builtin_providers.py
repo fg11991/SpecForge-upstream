@@ -228,7 +228,6 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "dspark_ce_loss_alpha",
                 "dspark_l1_loss_alpha",
                 "dspark_confidence_head_alpha",
-                "dspark_draft_vocab_size",
             },
         }
 

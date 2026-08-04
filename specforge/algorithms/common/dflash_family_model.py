@@ -1158,15 +1158,19 @@ class OnlineDSparkModel(OnlineDFlashModel):
         # position. Cross-entropy needs a realizable label, so it drops the
         # positions whose true token was pruned away -- and must drop them from
         # its denominator too, or alpha_ce would silently scale with coverage.
+        # Unpruned, the two are the same tensor and the same sum, so reuse them
+        # rather than recomputing: the point is to leave that path's operator
+        # sequence exactly as it was, not merely to compute the same number.
         objective_target_ids = target_ids
         ce_weights = loss_weights
+        local_ce_den = local_loss_den
         if self.use_draft_vocab:
             label_index = self._pruned_head_state()[1]
             objective_target_ids = label_index[target_ids]
             ce_weights = loss_weights * (objective_target_ids >= 0).to(
                 loss_weights.dtype
             )
-        local_ce_den = ce_weights.sum()
+            local_ce_den = ce_weights.sum()
         need_target = self.dspark_l1_loss_alpha > 0 or (
             self.dspark_confidence_head_alpha > 0
             and getattr(self.draft_model, "confidence_head", None) is not None
@@ -1216,38 +1220,66 @@ class OnlineDSparkModel(OnlineDFlashModel):
         ) = totals
 
         global_loss_den = local_loss_den.detach().clone()
-        global_ce_den = local_ce_den.detach().clone()
         world_size = 1
         import torch.distributed as dist
 
-        if dist.is_available() and dist.is_initialized():
+        distributed = dist.is_available() and dist.is_initialized()
+        if distributed:
             world_size = dist.get_world_size()
             if world_size > 1:
                 dist.all_reduce(global_loss_den, op=dist.ReduceOp.SUM)
-                dist.all_reduce(global_ce_den, op=dist.ReduceOp.SUM)
         if float(global_loss_den) <= 0:
             raise ValueError("DSpark objective has no supervised target tokens")
-        if self.dspark_ce_loss_alpha > 0 and float(global_ce_den) <= 0:
-            raise ValueError(
-                "DSpark cross-entropy has no in-vocabulary target tokens; the "
-                "draft vocabulary covers none of this batch"
+
+        # Unpruned, cross-entropy shares the objective's denominator exactly, so
+        # it needs neither its own sum nor its own reduction. Emitting that
+        # second collective unconditionally would change the collective sequence
+        # of every existing run -- ranks must agree on the count and order of
+        # collectives -- so this branch is part of leaving that path alone, not
+        # a micro-optimization.
+        global_ce_den = global_loss_den
+        if self.use_draft_vocab:
+            global_ce_den = local_ce_den.detach().clone()
+            if world_size > 1:
+                dist.all_reduce(global_ce_den, op=dist.ReduceOp.SUM)
+            if self.dspark_ce_loss_alpha > 0 and float(global_ce_den) <= 0:
+                raise ValueError(
+                    "DSpark cross-entropy has no in-vocabulary target tokens; "
+                    "the draft vocabulary covers none of this batch"
+                )
+        if not self.use_draft_vocab:
+            # global_ce_den == global_loss_den here, so the split form below is
+            # algebraically identical -- but not bit-identical: with a decayed
+            # loss_weights the denominator is not an exactly representable value,
+            # and x/D + y/D rounds differently from (x + y)/D. Keeping the
+            # original expression means an existing run's loss curve does not
+            # move by a few ulps for a feature it does not use.
+            loss = (
+                world_size
+                * (
+                    self.dspark_ce_loss_alpha * ce_num
+                    + self.dspark_l1_loss_alpha * l1_num
+                    + self.dspark_confidence_head_alpha * confidence_num
+                )
+                / global_loss_den
             )
-        # Each term is a weighted mean over the positions it is defined on. When
-        # the vocabulary is not pruned global_ce_den == global_loss_den and this
-        # is algebraically the single-denominator form it replaces.
-        ce_term = (
-            self.dspark_ce_loss_alpha * ce_num / global_ce_den
-            if self.dspark_ce_loss_alpha > 0
-            else ce_num * 0.0
-        )
-        loss = world_size * (
-            ce_term
-            + (
-                self.dspark_l1_loss_alpha * l1_num
-                + self.dspark_confidence_head_alpha * confidence_num
+        else:
+            # Each term becomes a weighted mean over the positions it is defined
+            # on, so alpha_ce keeps its meaning instead of being scaled by how
+            # much of the batch the draft vocabulary happens to cover.
+            ce_term = (
+                self.dspark_ce_loss_alpha * ce_num / global_ce_den
+                if self.dspark_ce_loss_alpha > 0
+                else ce_num * 0.0
             )
-            / global_loss_den
-        )
+            loss = world_size * (
+                ce_term
+                + (
+                    self.dspark_l1_loss_alpha * l1_num
+                    + self.dspark_confidence_head_alpha * confidence_num
+                )
+                / global_loss_den
+            )
 
         ratio_metrics = {
             "acc": (correct_num, eval_den),
@@ -1282,8 +1314,11 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 # Target probability mass the pruned vocabulary can reach, in
                 # probability rather than token counts. draft_vocab_coverage
                 # answers "how often is the realized token proposable"; this
-                # answers "how much of the teacher's belief survives pruning",
-                # and it is the ceiling on tau_probabilistic.
+                # answers "how much of the teacher's belief survives pruning".
+                # It upper-bounds each position's single-step acceptance
+                # probability. It is NOT a bound on tau_probabilistic, which is
+                # 1 + sum_j prod_{k<=j} accept_k -- an anchor token plus
+                # cumulative products of those per-step probabilities.
                 ratio_metrics["teacher_kept_mass"] = (kept_mass_num, eval_den)
         metrics: Dict[str, object] = {
             "ratio_metrics": {

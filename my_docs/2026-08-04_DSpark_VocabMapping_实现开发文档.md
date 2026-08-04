@@ -355,7 +355,11 @@ Review 的数学是对的:`p̃_i = p_i / Σ_K p ≥ p_i`,所以 `Σ_K min(q_i, p
 
 #### 新增指标 `teacher_kept_mass`
 
-裁剪时上报,`Σ_K p_i` 在被监督 token 上的均值,即**教师信念中能被裁剪词表触及的比例**,也是 `tau_probabilistic` 的上界。与既有的 `draft_vocab_coverage` 是两个问题:后者答"实际出现的 token 有多大比例提得出来"(按 token 计数),前者答"教师的概率质量有多大比例活下来"(按概率计)。
+裁剪时上报,`Σ_K p_i` 在被监督 token 上的均值,即**教师信念中能被裁剪词表触及的比例**。
+
+它界的是**单步**接受概率:对第 j 个位置有 `accept_probability_j ≤ kept_mass_j`。**它不是 `tau_probabilistic` 的上界**——后者是 `1 + Σ_j Π_{k≤j} accept_probability_k`,含 anchor token 以及各步接受概率的累积乘积,和单步上界不是同一个量级的东西。做指标分析时不要把两者直接比。
+
+与既有的 `draft_vocab_coverage` 是两个问题:后者答"实际出现的 token 有多大比例提得出来"(按 token 计数),前者答"教师的概率质量有多大比例活下来"(按概率计)。
 
 #### 未裁剪路径保持逐位不变
 
@@ -367,7 +371,7 @@ Review 的数学是对的:`p̃_i = p_i / Σ_K p ≥ p_i`,所以 `Σ_K min(q_i, p
 |---|---|
 | `test_full_vocab_logsumexp_matches_the_dense_computation` | 分块归约 == 一次性 `logsumexp(lm_head(h))` |
 | `test_full_vocab_logsumexp_is_chunk_boundary_independent` | chunk 取 7 / 64 / V / 2V 结果一致 |
-| `test_acceptance_uses_true_target_mass_not_the_conditional` | review 反例的解析版:构造教师在 4 个 token 上均匀、K 只留 2 个,断言 `teacher_kept_mass ≈ 0.5` 且 tau 不超过该上界 |
+| `test_acceptance_uses_true_target_mass_not_the_conditional` | review 反例的解析版:构造教师在 4 个 token 上均匀、K 只留 2 个,断言 `teacher_kept_mass ≈ 0.5`,并用 `Π_{k≤j} a_k ≤ a_j ≤ kept_mass` 得到的宽松上界 `1 + block·kept_mass` 兜住 tau |
 | `test_full_vocab_run_reports_no_kept_mass` | 未裁剪时该指标不出现 |
 
 变异验证(确认测试会红):
@@ -380,7 +384,29 @@ Review 的数学是对的:`p̃_i = p_i / Σ_K p ≥ p_i`,所以 `Σ_K min(q_i, p
 #### 仍然存在的前置条件
 
 §4.1 那条硬前置没有因此解除:**SGLang 的 DSpark 推理内核是否消费 `d2t` 仍未确认**。本次修的是"训练端报告的接受率与精确 speculative decoding 语义一致";如果服务端采用的是别的验证协议(例如贪心 argmax 匹配),该量的定义还需要再对齐一次。区别在于:现在的公式对应一个**明确且标准**的协议,而改前的公式不对应任何实际协议。
-### 6.6 Review 没有覆盖到、我补跑的部分
+### 6.6 未裁剪路径的等价性(本轮补做的验证与修复)
+
+上线前提是:**不开小词表时,行为与 `7712377` 完全一致**。本轮做了差分验证,并因此发现三处此前未被发现的偏差。
+
+**验证方法**:同一脚本在两个 worktree(HEAD / `7712377`)各跑一次,对 loss、accuracy、全部 ratio metrics 的分子分母、以及全部梯度做 sha256 逐位比对;覆盖 4 种配置(默认 / `loss_decay_gamma=3` / alpha 重排 / `ce_alpha=0`)。
+
+发现并修复:
+
+1. **resume contract 多了一个 key,会让存量 checkpoint 无法续训。** `trainer.py:329` 对"契约里有、checkpoint 里没有"的 key 是硬报错。无条件写入 `dspark_draft_vocab_size` 会让**所有本功能之前产出的 DSpark checkpoint 全部无法 resume**——而该字段在未裁剪时只可能等于 `vocab_size`。改为仅在 `use_draft_vocab` 时写入。
+2. **`loss_decay_gamma` 非空时最终 loss 不逐位相同。** 我把 loss 拆成两个分母分别相除,`x/D + y/D` 与 `(x+y)/D` 在 D 为非整数值浮点时舍入不同(gamma=None 时 D 是整数值,除法精确,所以默认配置看不出来)。未裁剪路径改回原来的单分母表达式。
+3. **多卡下多发了一次 `all_reduce`。** 未裁剪时 CE 分母与 loss 分母完全相同,却仍额外归约一次 `global_ce_den`。各 rank 必须在 collective 的**数量和顺序**上一致,这不是性能问题而是正确性问题;单进程验证看不到它。改为仅在裁剪时发第二次归约,`local_ce_den` 也直接复用 `local_loss_den` 不再重算。
+
+对应新增测试:
+
+| 测试 | 保证 |
+|---|---|
+| `test_full_vocab_loss_keeps_the_single_denominator_form` | 未裁剪时最终 loss 逐位等于旧单分母公式,含 `loss_decay_gamma` 情形 |
+| `test_full_vocab_run_emits_one_denominator_all_reduce` | mock 分布式环境,断言未裁剪发 1 次、裁剪发 2 次归约 |
+| `DSparkResumeContractTest`(3 个) | 未裁剪的契约不含新 key;裁剪时含且只多这一个 key |
+
+变异验证:三者分别注入对应故障后都会失败。
+
+### 6.7 Review 没有覆盖到、我补跑的部分
 
 Review 的验证清单里**没有任何 EAGLE3 路径的测试**,而本次改动动了 `Eagle3DraftModel` 的基类、删了它自己的 `load_vocab_mapping`、并让共用实现新增了旧路径从未做过的 `validate_vocab_mapping_consistency`(§3 第 5 条)。补跑:
 
@@ -396,11 +422,11 @@ tests/test_runtime/test_equiv_4rank.py
 
 另外 review 也没跑仓库级的配置清单测试,而 `430619a` 新增的 `configs/qwen3-8b-dspark-draftvocab32k.json` 漏了登记:`test_package_architecture.py`(dspark config 集合)、`test_example_draft_config_wiring.py`(每个 draft config 必须有 recipe)、`test_launch_topology.py`(每个 recipe 必须有 golden topology)三处都会失败。已补上登记,并新增 `examples/configs/qwen3-8b-dspark-draftvocab32k-offline.yaml`(选 offline/colocated,因为该拓扑能自行推导映射,不需要 `vocab_mapping_path`)。
 
-### 6.7 未采纳的建议
+### 6.8 未采纳的建议
 
 - **`torch.load(..., weights_only=True)`**:torch ≥ 2.6 已是默认值,此处是 no-op。改前的 EAGLE3 代码用的是裸 `torch.load(file_path)`,现状不比它弱,未改。
 
-### 6.8 Review 处置涉及的文件
+### 6.9 Review 处置涉及的文件
 
 ```
 新增:

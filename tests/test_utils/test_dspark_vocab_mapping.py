@@ -9,6 +9,7 @@ of the Markov head follows which vocabulary, which id space the labels live in
 
 import unittest
 from collections import Counter
+from unittest import mock
 
 import torch
 from torch import nn
@@ -306,6 +307,64 @@ class DSparkDraftVocabTest(unittest.TestCase):
                     f"{name}: {actual[name]} != {want}",
                 )
 
+    def test_full_vocab_loss_keeps_the_single_denominator_form(self):
+        """Pin the final scalar too, not just the terms it is built from.
+
+        Pruning gives cross-entropy its own denominator. Unpruned the two
+        denominators are equal, so the split form is algebraically the same --
+        but ``x/D + y/D`` and ``(x + y)/D`` do not round the same way once a
+        decayed ``loss_weights`` makes ``D`` inexact, which is precisely the
+        configuration this checks. Existing runs must not see their loss move.
+        """
+        for gamma in (None, 3.0):
+            with self.subTest(loss_decay_gamma=gamma):
+                _draft, model = _build(VOCAB_SIZE, seed=1)
+                model.loss_decay_gamma = gamma
+                torch.manual_seed(42)
+                loss, _accuracy, _metrics = model(**_inputs())
+
+                # The metrics carry the very tensors the loss was built from, so
+                # the pre-pruning expression can be rebuilt exactly.
+                ratios = _metrics["ratio_metrics"]
+                ce_num, _ce_den = ratios["ce_loss"]
+                l1_num, loss_den = ratios["l1_loss"]
+                confidence_num, _ = ratios["confidence_loss"]
+                world_size = 1  # no process group is initialized under test
+                expected = (
+                    world_size
+                    * (
+                        model.dspark_ce_loss_alpha * ce_num
+                        + model.dspark_l1_loss_alpha * l1_num
+                        + model.dspark_confidence_head_alpha * confidence_num
+                    )
+                    / loss_den
+                )
+                self.assertTrue(torch.equal(loss, expected), f"{loss} != {expected}")
+
+    def test_full_vocab_run_emits_one_denominator_all_reduce(self):
+        """Pin the collective sequence: single-process runs cannot observe it.
+
+        Ranks must agree on the count and order of collectives. Pruning gives
+        cross-entropy its own denominator and therefore a second all_reduce; an
+        unpruned run must keep emitting exactly the one it always did, or a
+        multi-GPU resume onto this branch would desynchronize.
+        """
+        for draft_vocab_size, expected in ((VOCAB_SIZE, 1), (DRAFT_VOCAB_SIZE, 2)):
+            with self.subTest(draft_vocab_size=draft_vocab_size):
+                draft, model = _build(draft_vocab_size)
+                if draft_vocab_size != VOCAB_SIZE:
+                    draft.install_vocab_mapping(*_mapping())
+                calls = []
+                with mock.patch.multiple(
+                    "torch.distributed",
+                    is_available=lambda: True,
+                    is_initialized=lambda: True,
+                    get_world_size=lambda: 4,
+                    all_reduce=lambda tensor, **kw: calls.append(tensor),
+                ):
+                    model(**_inputs())
+                self.assertEqual(len(calls), expected)
+
     def test_full_vocab_coverage_terms_are_degenerate(self):
         """The two terms pruning added must be no-ops without pruning."""
         _draft, model = _build(VOCAB_SIZE, seed=1)
@@ -505,8 +564,10 @@ class DSparkDraftVocabTest(unittest.TestCase):
         kept_mass = float(kept_mass_num) / float(eval_den)
         self.assertAlmostEqual(kept_mass, 0.5, places=3)
 
-        # tau counts the anchor token plus the expected accepted suffix, and
-        # every suffix step is capped by the reachable mass.
+        # kept_mass bounds each SINGLE-STEP acceptance probability, not tau.
+        # tau = 1 + sum_j prod_{k<=j} a_k, so the bound below is the loose one
+        # that follows from prod_{k<=j} a_k <= a_j <= kept_mass: an anchor token
+        # plus at most one kept_mass per suffix position.
         tau_num, tau_den = ratios["tau_probabilistic"]
         tau = float(tau_num) / float(tau_den)
         self.assertLessEqual(tau, 1.0 + BLOCK * kept_mass + 1e-4)
@@ -560,6 +621,37 @@ class DSparkDraftVocabTest(unittest.TestCase):
         unset = DSparkDraftModel(_draft_config(None))
         self.assertEqual(unset.draft_vocab_size, VOCAB_SIZE)
         self.assertFalse(unset.use_draft_vocab)
+
+
+class DSparkResumeContractTest(unittest.TestCase):
+    """The resume contract must not grow a key unpruned runs cannot supply."""
+
+    STEP = builtin_algorithm_registry().resolve("dspark").providers.step
+
+    def _contract(self, draft_vocab_size):
+        draft, model = _build(draft_vocab_size)
+        return self.STEP.resume_contract(None, draft, model)
+
+    def test_full_vocab_contract_has_no_draft_vocab_size_key(self):
+        """Trainer treats a contract key a checkpoint lacks as fatal.
+
+        Every DSpark checkpoint written before pruning existed carries no
+        dspark_draft_vocab_size, so recording it unconditionally would make all
+        of them unresumable -- for a field that, unpruned, could only ever hold
+        vocab_size.
+        """
+        self.assertNotIn("dspark_draft_vocab_size", self._contract(VOCAB_SIZE))
+
+    def test_pruned_contract_records_the_draft_vocab_size(self):
+        contract = self._contract(DRAFT_VOCAB_SIZE)
+        self.assertEqual(contract["dspark_draft_vocab_size"], DRAFT_VOCAB_SIZE)
+
+    def test_pruning_adds_exactly_one_key(self):
+        """Nothing else about the contract may shift with the feature."""
+        full = self._contract(VOCAB_SIZE)
+        pruned = self._contract(DRAFT_VOCAB_SIZE)
+        self.assertEqual(set(pruned) - set(full), {"dspark_draft_vocab_size"})
+        self.assertEqual(set(full) - set(pruned), set())
 
 
 class DSparkVocabMappingPlanningTest(unittest.TestCase):
