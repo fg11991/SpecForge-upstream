@@ -37,6 +37,43 @@ import torch
 OUT_OF_DRAFT_VOCAB_LABEL = -100
 
 
+def _reject_conflicting_vocab_mapping(
+    module, state_dict, prefix, *_load_hook_args
+) -> None:
+    """Refuse to silently replace an installed mapping with a different one.
+
+    This is the resume hazard: the run resolves a mapping (from
+    ``model.vocab_mapping_path``, or derived from the offline features), and then
+    ``load_state_dict`` overwrites it with whatever the checkpoint carried. With
+    the same ``draft_vocab_size`` nothing complains, yet every row of the pruned
+    head now means a different token than the run believes. It does not crash --
+    it just trains against a quietly wrong label space.
+
+    Recording a fingerprint in the resume contract would not catch this: the
+    contract is bound in ``build_model_bundle``, which runs *before*
+    ``_ensure_offline_vocab_mapping`` installs the derived mapping, so the
+    fingerprint would describe an empty one. Comparing at load time has no such
+    ordering dependency.
+    """
+    if not module.vocab_mapping_loaded:
+        return
+    incoming = state_dict.get(prefix + "t2d")
+    if incoming is None:
+        return
+    current = module.t2d
+    incoming = incoming.to(device=current.device, dtype=current.dtype)
+    if incoming.shape == current.shape and torch.equal(incoming, current):
+        return
+    raise ValueError(
+        "the checkpoint's vocabulary mapping differs from the one this run "
+        f"resolved ({int(current.sum())} kept tokens vs "
+        f"{int(incoming.sum())} in the checkpoint, differing selections); the "
+        "pruned lm_head rows would silently change meaning. Point "
+        "model.vocab_mapping_path at the mapping this checkpoint was trained "
+        "with, or start a fresh run."
+    )
+
+
 def _invalidate_vocab_mapping_derivations(module, _incompatible_keys) -> None:
     """Bump the mapping version and drop everything derived from the buffers.
 
@@ -118,6 +155,7 @@ class DraftVocabMappingMixin:
             # load_state_dict writes the buffers behind our back, so anything
             # derived from them (the row-sliced head, the label lookup) has to be
             # invalidated here or a resumed run keeps using the previous slice.
+            self.register_load_state_dict_pre_hook(_reject_conflicting_vocab_mapping)
             self.register_load_state_dict_post_hook(
                 _invalidate_vocab_mapping_derivations
             )

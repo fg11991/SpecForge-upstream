@@ -50,8 +50,11 @@ def resume_contract(_config, draft_model, training_model):
 
     return {
         "dspark_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
-        # A resume that silently changed the pruned vocabulary would keep
-        # training a head whose rows no longer mean what they did before.
+        # Catches a changed K before any weight is loaded, and nothing more:
+        # two mappings of the same size select different tokens without
+        # disagreeing here. Which tokens is checked where the buffers actually
+        # meet, in _reject_conflicting_vocab_mapping -- the contract is bound
+        # before the offline mapping is installed, so it cannot see it.
         "dspark_draft_vocab_size": int(
             getattr(draft_model, "draft_vocab_size", draft_model.config.vocab_size)
         ),

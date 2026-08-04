@@ -434,12 +434,15 @@ class DSparkDraftVocabTest(unittest.TestCase):
         )
         target_model(**_inputs())
 
-    def test_state_dict_load_invalidates_a_head_built_from_the_old_mapping(self):
-        """Loading over a model that already ran must not reuse the old slice."""
-        first_draft, model = _build(DRAFT_VOCAB_SIZE)
+    def test_loading_a_conflicting_mapping_is_rejected(self):
+        """The resume hazard: same K, different tokens, no error, wrong labels.
+
+        Nothing about the shapes disagrees, so without this check the run keeps
+        training with lm_head rows that mean different tokens than it believes.
+        """
+        resolved, _model = _build(DRAFT_VOCAB_SIZE)
         t2d, d2t = _mapping()
-        first_draft.install_vocab_mapping(t2d, d2t)
-        before = model._pruned_head_state()[0].clone()
+        resolved.install_vocab_mapping(t2d, d2t)
 
         other = Counter({token: token + 1 for token in range(VOCAB_SIZE)})
         other_d2t, other_t2d = process_token_dict_to_mappings(
@@ -447,9 +450,21 @@ class DSparkDraftVocabTest(unittest.TestCase):
         )
         donor, _ = _build(DRAFT_VOCAB_SIZE, seed=7)
         donor.install_vocab_mapping(other_t2d, other_d2t)
-        first_draft.load_state_dict(donor.state_dict())
+        self.assertEqual(int(donor.t2d.sum()), int(resolved.t2d.sum()))
 
-        self.assertFalse(torch.equal(before, model._pruned_head_state()[0]))
+        with self.assertRaisesRegex(ValueError, "differs from the one this run"):
+            resolved.load_state_dict(donor.state_dict())
+
+    def test_loading_an_identical_mapping_is_allowed(self):
+        """A matching mapping is the normal resume; it must not be an error."""
+        resolved, _model = _build(DRAFT_VOCAB_SIZE)
+        donor, _ = _build(DRAFT_VOCAB_SIZE, seed=7)
+        t2d, d2t = _mapping()
+        resolved.install_vocab_mapping(t2d, d2t)
+        donor.install_vocab_mapping(t2d, d2t)
+
+        resolved.load_state_dict(donor.state_dict())
+        self.assertTrue(torch.equal(resolved.t2d, t2d))
 
     def test_draft_vocab_size_rejects_degenerate_values(self):
         """0 must not be coerced to "full vocabulary" behind the user's back."""
