@@ -25,6 +25,10 @@ if hasattr(torch, "npu") and torch.npu.is_available():
     FLEX_ATTENTION_AVAILABLE = False
 
 
+#: Vocabulary rows per chunk when reducing the teacher's full-vocab normalizer.
+#: Bounds a transient [tokens, chunk] tensor only; it does not affect results.
+_TEACHER_NORMALIZER_VOCAB_CHUNK = 32768
+
 _VALID_LOSS_TYPES = {
     "dflash",
     "dpace",
@@ -201,6 +205,28 @@ class OnlineDFlashModel(nn.Module):
             return self.lm_head(hidden_states)
         weight = self._pruned_head_state()[0]
         return F.linear(hidden_states.to(weight.dtype), weight)
+
+    def _full_vocab_logsumexp(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """``log sum_v exp(target_logit_v)`` over the FULL target vocabulary.
+
+        Needed to turn pruned logits into true probabilities instead of
+        probabilities conditioned on the token having survived pruning. Only the
+        scalar normalizer is wanted, so the vocabulary is walked in chunks and
+        each chunk is reduced immediately: the ``[..., vocab_size]`` tensor that
+        pruning exists to avoid is never materialized. Callers hold
+        ``torch.no_grad()``, so this costs one extra projection in compute and
+        nothing in activation memory.
+
+        Returns ``hidden_states`` without its feature dimension.
+        """
+        weight = self.lm_head.weight
+        partials = []
+        for start in range(0, int(weight.shape[0]), _TEACHER_NORMALIZER_VOCAB_CHUNK):
+            rows = weight[start : start + _TEACHER_NORMALIZER_VOCAB_CHUNK]
+            chunk_logits = F.linear(hidden_states.to(rows.dtype), rows).float()
+            partials.append(torch.logsumexp(chunk_logits, dim=-1))
+        # logsumexp is associative over any partition of the vocabulary.
+        return torch.logsumexp(torch.stack(partials, dim=-1), dim=-1)
 
     def _sample_anchor_positions(
         self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
@@ -973,26 +999,61 @@ class OnlineDSparkModel(OnlineDFlashModel):
 
         draft_probabilities = None
         teacher_ids = None
+        kept_mass_num = zero
         if aligned_target_hidden is not None:
+            flat_teacher = aligned_target_hidden.reshape(
+                batch_size,
+                num_blocks * block_size,
+                hidden_size,
+            )
             with torch.no_grad():
                 # The teacher must use the SAME head rows as the student: that is
                 # what turns the pruned objective into a match against the target
                 # distribution renormalized over the kept tokens, rather than a
                 # match against a truncated (sub-normalized) one.
-                target_logits = self.apply_objective_head(
-                    aligned_target_hidden.reshape(
-                        batch_size,
-                        num_blocks * block_size,
-                        hidden_size,
-                    )
-                ).reshape_as(draft_logits)
-                target_probabilities = torch.softmax(target_logits.float(), dim=-1)
+                target_logits = self.apply_objective_head(flat_teacher).reshape_as(
+                    draft_logits
+                )
+                # Distillation target: renormalized over the kept tokens. The
+                # draft cannot place mass outside them, so its distribution sums
+                # to one there; a target summing to the kept mass instead would
+                # give the loss an irreducible floor and bias every gradient.
+                teacher_conditional = torch.softmax(target_logits.float(), dim=-1)
                 teacher_ids = target_logits.argmax(dim=-1)
+                if self.use_draft_vocab:
+                    # Acceptance target: the target's TRUE probabilities, which
+                    # sum to the kept mass, not to one. Renormalizing here would
+                    # claim a token is accepted at the rate it would have if the
+                    # pruned tokens did not exist -- see _full_vocab_logsumexp.
+                    full_log_normalizer = self._full_vocab_logsumexp(
+                        flat_teacher
+                    ).reshape(batch_size, num_blocks, block_size, 1)
+                    target_probabilities = torch.exp(
+                        target_logits.float() - full_log_normalizer
+                    )
+                else:
+                    target_probabilities = teacher_conditional
             draft_probabilities = torch.softmax(draft_logits.float(), dim=-1)
             l1_per_token = (
-                (draft_probabilities - target_probabilities).abs().sum(dim=-1)
+                (draft_probabilities - teacher_conditional).abs().sum(dim=-1)
             )
-            accept_probability = (1.0 - 0.5 * l1_per_token).clamp(0.0, 1.0)
+            if self.use_draft_vocab:
+                # sum_i min(q_i, p_i) over the kept tokens: the exact single-step
+                # acceptance rate for a draft that can only propose them. Bounded
+                # above by the kept mass, which is the ceiling pruning imposes.
+                accept_probability = (
+                    torch.minimum(draft_probabilities, target_probabilities)
+                    .sum(dim=-1)
+                    .clamp(0.0, 1.0)
+                )
+                kept_mass_num = (
+                    target_probabilities.sum(dim=-1) * eval_mask
+                ).sum()
+            else:
+                # Algebraically the same quantity when the teacher sums to one.
+                # Kept as the original expression so the unpruned path stays
+                # bit-identical rather than merely equivalent.
+                accept_probability = (1.0 - 0.5 * l1_per_token).clamp(0.0, 1.0)
             if self.dspark_l1_loss_alpha > 0:
                 l1_num = (l1_per_token * loss_weights).sum()
 
@@ -1068,6 +1129,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             draft_top1_num,
             tau_num,
             tau_den,
+            kept_mass_num,
         )
 
     def _compute_dspark_loss(
@@ -1150,6 +1212,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             draft_top1_num,
             tau_num,
             tau_den,
+            kept_mass_num,
         ) = totals
 
         global_loss_den = local_loss_den.detach().clone()
@@ -1215,6 +1278,13 @@ class OnlineDSparkModel(OnlineDFlashModel):
                     "tau_probabilistic": (tau_num, tau_den),
                 }
             )
+            if self.use_draft_vocab:
+                # Target probability mass the pruned vocabulary can reach, in
+                # probability rather than token counts. draft_vocab_coverage
+                # answers "how often is the realized token proposable"; this
+                # answers "how much of the teacher's belief survives pruning",
+                # and it is the ceiling on tau_probabilistic.
+                ratio_metrics["teacher_kept_mass"] = (kept_mass_num, eval_den)
         metrics: Dict[str, object] = {
             "ratio_metrics": {
                 name: (numerator.detach(), denominator.detach())

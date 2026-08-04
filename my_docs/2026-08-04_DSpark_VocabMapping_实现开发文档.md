@@ -5,9 +5,9 @@
 基线:`fix/offline-reader-lazy-assembly` @ `7712377`(*offline: list feature files at assembly, read tensors lazily*)
 工作目录:独立 worktree `SpecForge-dspark-vocab/`(主 worktree 当时在 `feat/epoch-progress-reporting` 上有未提交改动,其中包含 `assembly.py`,为避免污染而隔离)
 
-本文写给 review 的人。第 1 节说清楚**依据是什么**,第 2 节说清楚**改了什么、为什么**,第 3 节列出**我认为最该被质疑的点**,第 4 节是**没做的事和前置条件**,第 5 节是**收到 review 后改了什么**。
+本文写给 review 的人。第 1 节说清楚**依据是什么**,第 2 节说清楚**改了什么、为什么**,第 3 节列出**我认为最该被质疑的点**,第 4 节是**没做的事和前置条件**,第 6 节是**收到 review 后改了什么**。
 
-> **本文已按 review 结果修订。** `my_docs/2026-08-04_DSpark_VocabMapping_代码Review.md` 提出 6 条 finding,全部核实为真。其中 F4 直接推翻了本文原先"unpruned 逐位不变、有测试守着"的结论——当时那个测试是空的。第 5 节记录了逐条处置,§2.8/§2.9 已同步更新。
+> **本文已按 review 结果修订。** `my_docs/2026-08-04_DSpark_VocabMapping_代码Review.md` 提出 6 条 finding,全部核实为真。其中 F4 直接推翻了本文原先"unpruned 逐位不变、有测试守着"的结论——当时那个测试是空的。第 6 节记录了逐条处置,§2.8/§2.9 已同步更新。
 
 ---
 
@@ -148,7 +148,7 @@ loss = world_size * ( α_ce·ce_num/global_ce_den
 
 **不裁剪时 `global_ce_den == global_loss_den`,与改前的单分母形式代数等价**——由 `test_full_vocab_objective_matches_the_pre_pruning_formula` 守着:该测试内联了一份 `7712377` 版目标函数的**逐字转写**,用同一份权重、同一批输入,对 14 个 numerator/denominator 逐项做 `torch.equal` 比对。
 
-> 修订说明:此处原本引用的是 `test_identity_vocab_reproduces_the_unpruned_objective`,那个测试在同一分支上用同一 seed 建两个模型互比,只能证明可复现性,证明不了与旧目标函数一致(review F4)。现已替换,并通过注入变异验证过它会失败(见 §5)。
+> 修订说明:此处原本引用的是 `test_identity_vocab_reproduces_the_unpruned_objective`,那个测试在同一分支上用同一 seed 建两个模型互比,只能证明可复现性,证明不了与旧目标函数一致(review F4)。现已替换,并通过注入变异验证过它会失败(见 §6.4)。
 
 新增指标 `draft_vocab_coverage`(在表 token 占被监督 token 的比例)。这是接受率的硬上界,应该出现在训练日志里,而不是事后审计。`ce_loss` 的分母改为 `local_ce_den`,`ce_position` 的分母改为 `ce_position_den`,让日志里的 CE 在裁剪/不裁剪之间可比。
 
@@ -236,14 +236,15 @@ failed / ERROR 的**具体清单与基线逐行相同**——用 `comm -23` 逐�
 - 未修改任何现存 `configs/*.json` 或 `examples/configs/*.yaml`。启用裁剪需要显式换配置。
 - 未给 DFlash / Domino 启用词表裁剪。模型层的 buffer 与 `draft_logits_from_target_head` 对 DFlash 是通用的,但目标层 (`_dflash_objective_chunk_terms` / `_domino_objective_chunk_terms`) 未改,契约层也没开。所有新逻辑都用 `use_draft_vocab` 短路,Domino 路径不受影响。
 - 未提供 online/disaggregated 场景下自动生成映射的工具。该拓扑仍要求显式 `model.vocab_mapping_path`(生产者与消费者无法各自推导出同一份映射),与 EAGLE3 现状一致。可用 `scripts/prepare_hidden_states.py` 或 `specforge/data/preprocessing.py::generate_vocab_mapping_file` 预生成。
-- 未释放裁剪后 `self.lm_head` 的全量权重。qwen3-8b 上那是约 1.2 GB 的死重(裁剪头另占约 262 MB 拷贝)。可作为后续优化,但需要先确认没有别的使用者。
+- 未释放裁剪后 `self.lm_head` 的全量权重(qwen3-8b 上约 1.2 GB,裁剪头另占约 262 MB 拷贝)。**注意:F2 修复后它不再是死重**——`_full_vocab_logsumexp` 需要全量行来算教师的归一化因子,所以除非改成在 capture 阶段预存该标量,否则不能释放。
 - 未做多卡 / NPU 实测(见 §3.6)。
 
 ### 4.3 预期收益(沿用参考文档的口径,未实测)
 
 以 `qwen3-8b-dspark` (V=151936, K=32000, block=7, anchors=512, rank=256, chunk=128) 为例:
 
-- objective logits 张量:每 chunk `128×7×151936×2B ≈ 272 MB` → `≈ 57 MB`,**4.75×**;同时头的 GEMM FLOPs 同比例下降
+- objective logits 张量:每 chunk `128×7×151936×2B ≈ 272 MB` → `≈ 57 MB`,**4.75×**
+- 学生头 GEMM(含反传)同比例下降;**教师侧算力回到基线水平**,因为 §6.5 修 F2 时重新引入了一次全词表投影来算归一化因子。该投影分块归约、不物化 `[...,V]`,所以显存收益不受影响,算力收益打折。后续可通过在 capture 阶段存下 log-normalizer 标量彻底消除(见 §6.5)
 - Markov 头参数:`W1+W2 = 77.8M` → `47.1M`(只有 W2 缩小),对应 AdamW 状态省约 40%
 - 代价:接受率上界 = 训练分布下 top-K 覆盖率,由新增的 `draft_vocab_coverage` 指标直接可观测
 
@@ -277,34 +278,34 @@ tests/test_algorithms/test_builtin_providers.py     resume contract 替身补字
 
 ---
 
-## 5. Review 处置(2026-08-04,commit `f42dca1` + `2b19e27`)
+## 6. Review 处置(2026-08-04,commit `f42dca1` / `2b19e27` / `HEAD`)
 
 Review 文档:`my_docs/2026-08-04_DSpark_VocabMapping_代码Review.md`,针对 `430619a`。
-**6 条 finding 全部核实为真,无误报。** 其中 F1、F5 用最小脚本复现,F2 用推导确认,F3、F4、F6 读代码确认。
+**6 条 finding 全部核实为真,无误报,现已全部处置。** 其中 F1、F5 用最小脚本复现,F2 用推导确认,F3、F4、F6 读代码确认。
 
 | # | 问题 | 处置 | commit |
 |---|---|---|---|
 | F1 | checkpoint reload 后 mapping 状态丢失,裁剪权重不可用 | 已修 | `f42dca1` |
-| F2 | 接受概率遗漏裁剪词表外的概率质量,confidence 系统性偏高 | **未修,见下** | — |
+| F2 | 接受概率遗漏裁剪词表外的概率质量,confidence 系统性偏高 | 已修 | `HEAD` |
 | F3 | 全词表 + `vocab_mapping_path`:校验放行、建模必挂 | 已修(范围收窄) | `f42dca1` |
 | F4 | "复现旧 objective"的回归测试实际是空的 | 已修 | `f42dca1` |
 | F5 | `draft_vocab_size=0` 被静默当成全词表 | 已修 | `f42dca1` |
 | F6 | resume contract 只记 K,不记 K 个 token 的身份 | 已修(换了落点) | `2b19e27` |
 
-### 5.1 F1 — 改成从 buffer 派生,而不是加 load hook 补设标志位
+### 6.1 F1 — 改成从 buffer 派生,而不是加 load hook 补设标志位
 
 Review 建议加 state-dict load hook,在确认 buffer 加载成功后再置 `vocab_mapping_loaded=True`。
 实际采用的是更强的做法:**把 `vocab_mapping_loaded` 变成从 `t2d` 内容派生的 property**。理由是标志位的失效路径不止 `load_state_dict` 一条(还有 `from_pretrained`、直接 `copy_` 到 buffer、FSDP 的 buffer 广播),任何绕过我们方法的路径都会让标志位再次说谎;而"`t2d` 全 False"本来就是唯一无歧义的未安装态——真实映射必然恰好选中 `draft_vocab_size` 个 token。
 
 派生缓存的失效仍然需要 hook,这部分按 review 的建议做了(`_invalidate_vocab_mapping_derivations` 挂在 load post hook 上,与 `install_vocab_mapping` 共用同一个失效点)。
 
-### 5.2 F3 — review 的判断对,但我第一版把范围写宽了
+### 6.2 F3 — review 的判断对,但我第一版把范围写宽了
 
 按 review 原样实现后,`examples/configs/longcat-flash-eagle3-online.yaml` 立刻失败:它是全词表 EAGLE3(131072 == 131072)却带着 `vocab_mapping_path`。
 
 关键区别:**EAGLE3 / P-EAGLE 无条件注册 `t2d`/`d2t`,所以这个组合今天装的是恒等映射,能正常跑**;DFlash 家族只在裁剪时注册,同样的配置才是硬失败。F3 描述的"校验放行、建模必挂"只对后者成立。用一条仓库里现存且能工作的配置去迁就我新发明的规则是本末倒置,因此把判据显式化为 `AlgorithmCapabilities.keeps_vocab_buffers_when_unpruned`,只对 DFlash 家族报错。
 
-### 5.3 F4 — 新测试验证过"会红"
+### 6.3 F4 — 新测试验证过"会红"
 
 新的 `test_full_vocab_objective_matches_the_pre_pruning_formula` 内联 `_reference_dspark_chunk_terms`,是 `7712377` 版目标函数的逐字转写(刻意转写而非 import——从被测实现生成的参照检测不出被测实现的变化)。
 
@@ -316,24 +317,70 @@ Review 建议加 state-dict load hook,在确认 buffer 加载成功后再置 `vo
 | `accept_probability` 系数 0.5 → 0.4 | 3 failed |
 | 还原 | 18 passed |
 
-### 5.4 F6 — fingerprint 放不进 resume contract,改在 load 处比对
+### 6.4 F6 — fingerprint 放不进 resume contract,改在 load 处比对
 
 Review 已经指出时序问题:`bind_runtime()` 在 `build_model_bundle` 里执行,而 offline 自动 mapping 在 `_ensure_offline_vocab_mapping`(`assembly.py:607`)才安装,晚于前者。在 resume contract 里算 fingerprint 会记下一个空映射。
 
 因此没有走 fingerprint,改为在 `load_state_dict` 的 pre hook 里直接比对:已装映射与 checkpoint 携带的映射不一致就报错。这个落点两份映射都在场,不依赖任何顺序假设。相同映射照常加载(正常 resume 路径)。`dspark_draft_vocab_size` 保留(能在加载任何权重之前拦下 K 变化),但注释不再宣称它能防住同 K 换 token。
+### 6.5 F2 — 已修
 
-### 5.5 F2 — 未修,这是启用裁剪训练前的阻塞项
+Review 的数学是对的:`p̃_i = p_i / Σ_K p ≥ p_i`,所以 `Σ_K min(q_i, p̃_i) ≥ Σ_K min(q_i, p_i)`。原实现给出的是条件分布下的 overlap,系统性高于真实接受率。它给的反例(target 4 均匀、K 取 2、draft 恰为条件分布)算出 1.0 vs 真值 0.5,成立。**未裁剪时这个量本来就是精确 SD 接受率**,所以裁剪静默改变了它的语义,是回归而不只是不精确。
 
-数学上 review 是对的:`p̃_i = p_i / Σ_K p ≥ p_i`,所以 `Σ_K min(q_i, p̃_i) ≥ Σ_K min(q_i, p_i)`,当前实现给出的是条件分布下的 overlap,系统性高于真实接受率。它给的反例(target 4 均匀、K 取 2、draft 恰为条件分布)算出 1.0 vs 真值 0.5,成立。**未裁剪时这个量本来就是精确 SD 接受率**,所以裁剪静默改变了它的语义,这是回归而不只是不精确。
+#### 关键区分:损失用条件分布,接受率用真实分布
 
-没有在本轮修,原因有二:
+这两个量必须分开,合并任何一边都是错的:
 
-1. **修复代价 review 没有估。** 拿到 kept mass 需要全词表 log-normalizer,即多一次全词表 matmul。好在整段在 `torch.no_grad()` 下,不占激活显存,但会吃掉一部分算力收益,不是"改几行"。
-2. **正确公式取决于服务端的验证协议**,而 §4.1 那个硬前置(SGLang 的 DSpark 是否消费 `d2t`)仍未解决。在协议确定前把公式改成另一种猜测,只是把一个已知偏差换成另一个。
+| 用途 | 教师 | 理由 |
+|---|---|---|
+| L1 蒸馏损失(α=0.9) | `p̃` = 在 K 上 softmax 重归一化 | draft 物理上无法在 K 外放质量,其分布在 K 上必然和为 1。若目标改用和为 `m<1` 的真实 `p`,损失会有 `1-m` 的不可约下界,并把梯度整体压偏。speculators 同样在 `draft_vocab_size` 维上 softmax |
+| `accept_probability` | 真实 `p`(和为 `m ≤ 1`) | 它是对服务端接受率的**预测**,喂给 confidence head 的 BCE 目标和 `tau_probabilistic`。裁剪掉的概率质量在服务时是真实的拒绝 |
 
-影响范围有限:目前没有任何出厂 config 设 `draft_vocab_size`,这条路径是纯 opt-in。但**在真正开启裁剪训练之前必须先解决它**,否则 confidence head 学到的是偏乐观的接受率,`tau_probabilistic` 同样偏高。
+实现:`teacher_conditional = softmax(target_logits)` 供损失使用;`target_probabilities = exp(target_logits - full_log_normalizer)` 供接受率使用,后者是**未归一化的真实概率**。接受率改为 `Σ_K min(q_i, p_i)`,上界自然是 kept mass。
 
-### 5.6 Review 没有覆盖到、我补跑的部分
+#### 全词表归一化因子怎么拿
+
+新增 `OnlineDFlashModel._full_vocab_logsumexp()`:按词表分块走 `lm_head.weight`,每块立即 `logsumexp` 归约后只保留标量,最后用 `logsumexp` 的可结合性合并。**裁剪要避免的 `[..., V]` 张量始终没有被物化**;调用点在 `torch.no_grad()` 内,因此不产生激活显存和反传。
+
+#### 代价(review 未估,这里说清楚)
+
+多一次全词表投影。以 qwen3-8b(V=151936, H=4096)每 chunk 128×7 token 计,约 1.1 TFLOP,而裁剪后学生头的前反传合计约 0.7 TFLOP——**教师归一化会成为该段的主要开销**。
+
+需要放到正确的坐标系里看:未裁剪的基线里教师本来就做一次全词表投影,所以这不是新增开销,而是**教师侧退回基线水平**。裁剪保住的是:
+
+- 学生头前反传 4.75× 更省(大头,因为它有反传)
+- `[B,N,K,V]` logits/CE/softmax 激活 4.75× 更省(原分析文档中显存的头号目标)
+- 教师侧:显存仍省(分块归约,不物化),**算力回到基线**
+
+**后续优化方向(未做)**:target 的全词表 log-normalizer 是每 token 一个标量,完全可以在 capture 阶段和 `target_last_hidden_states` 一起存下来,带宽代价可忽略(1 float vs 151936)。那样这次的额外投影可以完全省掉。没有在本轮做,因为它要改 capture contract、normalizer、collator 和离线存储格式,并会让已采集的 feature 失效——那是独立的一次改动。
+
+#### 新增指标 `teacher_kept_mass`
+
+裁剪时上报,`Σ_K p_i` 在被监督 token 上的均值,即**教师信念中能被裁剪词表触及的比例**,也是 `tau_probabilistic` 的上界。与既有的 `draft_vocab_coverage` 是两个问题:后者答"实际出现的 token 有多大比例提得出来"(按 token 计数),前者答"教师的概率质量有多大比例活下来"(按概率计)。
+
+#### 未裁剪路径保持逐位不变
+
+未裁剪分支仍用原来的 `(1 - 0.5·l1).clamp(0,1)` 表达式,而不是统一成 `Σ min(q,p)`。两者在教师和为 1 时代数等价,但浮点算子序列不同、结果不逐位相同。§2.4 的参照测试要求 bit-exact,这个分支是刻意保留的——不能为了代码整齐给存量用户引入一个无收益的数值变化。
+
+#### 测试
+
+| 测试 | 保证 |
+|---|---|
+| `test_full_vocab_logsumexp_matches_the_dense_computation` | 分块归约 == 一次性 `logsumexp(lm_head(h))` |
+| `test_full_vocab_logsumexp_is_chunk_boundary_independent` | chunk 取 7 / 64 / V / 2V 结果一致 |
+| `test_acceptance_uses_true_target_mass_not_the_conditional` | review 反例的解析版:构造教师在 4 个 token 上均匀、K 只留 2 个,断言 `teacher_kept_mass ≈ 0.5` 且 tau 不超过该上界 |
+| `test_full_vocab_run_reports_no_kept_mass` | 未裁剪时该指标不出现 |
+
+变异验证(确认测试会红):
+
+| 变异 | 结果 |
+|---|---|
+| `target_probabilities` 退回 `teacher_conditional`(重现 F2 原 bug) | `test_acceptance_uses_true_target_mass_not_the_conditional` failed |
+| 分块归约只取首块 | `test_full_vocab_logsumexp_is_chunk_boundary_independent` failed |
+
+#### 仍然存在的前置条件
+
+§4.1 那条硬前置没有因此解除:**SGLang 的 DSpark 推理内核是否消费 `d2t` 仍未确认**。本次修的是"训练端报告的接受率与精确 speculative decoding 语义一致";如果服务端采用的是别的验证协议(例如贪心 argmax 匹配),该量的定义还需要再对齐一次。区别在于:现在的公式对应一个**明确且标准**的协议,而改前的公式不对应任何实际协议。
+### 6.6 Review 没有覆盖到、我补跑的部分
 
 Review 的验证清单里**没有任何 EAGLE3 路径的测试**,而本次改动动了 `Eagle3DraftModel` 的基类、删了它自己的 `load_vocab_mapping`、并让共用实现新增了旧路径从未做过的 `validate_vocab_mapping_consistency`(§3 第 5 条)。补跑:
 
@@ -349,11 +396,11 @@ tests/test_runtime/test_equiv_4rank.py
 
 另外 review 也没跑仓库级的配置清单测试,而 `430619a` 新增的 `configs/qwen3-8b-dspark-draftvocab32k.json` 漏了登记:`test_package_architecture.py`(dspark config 集合)、`test_example_draft_config_wiring.py`(每个 draft config 必须有 recipe)、`test_launch_topology.py`(每个 recipe 必须有 golden topology)三处都会失败。已补上登记,并新增 `examples/configs/qwen3-8b-dspark-draftvocab32k-offline.yaml`(选 offline/colocated,因为该拓扑能自行推导映射,不需要 `vocab_mapping_path`)。
 
-### 5.7 未采纳的建议
+### 6.7 未采纳的建议
 
 - **`torch.load(..., weights_only=True)`**:torch ≥ 2.6 已是默认值,此处是 no-op。改前的 EAGLE3 代码用的是裸 `torch.load(file_path)`,现状不比它弱,未改。
 
-### 5.8 本轮改动文件
+### 6.8 Review 处置涉及的文件
 
 ```
 新增:
@@ -364,7 +411,8 @@ specforge/modeling/draft/vocab_mixin.py           F1 派生 property + 失效 ho
 specforge/algorithms/contracts.py                 F3 新增 keeps_vocab_buffers_when_unpruned
 specforge/algorithms/dspark/providers.py          F3 声明该能力为 False;F6 修正 resume key 的注释
 specforge/application/planning.py                 F3 收窄后的校验
-tests/test_utils/test_dspark_vocab_mapping.py     F4 参照实现;F1/F5/F6 新增用例(13 → 19)
+specforge/algorithms/common/dflash_family_model.py  F2 全词表归一化因子;真实接受率;teacher_kept_mass
+tests/test_utils/test_dspark_vocab_mapping.py     F4 参照实现;F1/F2/F5/F6 新增用例(13 → 23)
 tests/test_runtime/test_package_architecture.py   登记新 config
 tests/test_config/test_example_draft_config_wiring.py  登记计数 63 → 64
 tests/test_config/test_launch_topology.py         登记新 recipe 的 golden topology

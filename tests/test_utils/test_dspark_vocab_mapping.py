@@ -123,6 +123,7 @@ _TERM_NAMES = (
     "draft_top1_num",
     "tau_num",
     "tau_den",
+    "kept_mass_num",
 )
 
 
@@ -433,6 +434,88 @@ class DSparkDraftVocabTest(unittest.TestCase):
             torch.equal(target.draft_vocab_index(), source.draft_vocab_index())
         )
         target_model(**_inputs())
+
+    def test_full_vocab_logsumexp_matches_the_dense_computation(self):
+        """The chunked normalizer must equal the one-shot one, exactly enough.
+
+        It is walked in vocabulary chunks to avoid materializing [.., V]; that
+        partitioning is the only thing that could make it wrong.
+        """
+        _draft, model = _build(DRAFT_VOCAB_SIZE)
+        hidden = torch.randn(1, 12, HIDDEN)
+
+        chunked = model._full_vocab_logsumexp(hidden)
+        dense = torch.logsumexp(model.lm_head(hidden).float(), dim=-1)
+
+        self.assertEqual(chunked.shape, dense.shape)
+        self.assertTrue(torch.allclose(chunked, dense, atol=1e-6, rtol=1e-6))
+
+    def test_full_vocab_logsumexp_is_chunk_boundary_independent(self):
+        """Chunking is an implementation detail and must not change the value."""
+        import specforge.algorithms.common.dflash_family_model as module
+
+        _draft, model = _build(DRAFT_VOCAB_SIZE)
+        hidden = torch.randn(1, 8, HIDDEN)
+        original = module._TEACHER_NORMALIZER_VOCAB_CHUNK
+        values = []
+        try:
+            for chunk in (7, 64, VOCAB_SIZE, VOCAB_SIZE * 2):
+                module._TEACHER_NORMALIZER_VOCAB_CHUNK = chunk
+                values.append(model._full_vocab_logsumexp(hidden))
+        finally:
+            module._TEACHER_NORMALIZER_VOCAB_CHUNK = original
+
+        for value in values[1:]:
+            self.assertTrue(torch.allclose(values[0], value, atol=1e-6, rtol=1e-6))
+
+    def test_acceptance_uses_true_target_mass_not_the_conditional(self):
+        """The review's counterexample, made analytic.
+
+        Build a teacher that puts all its mass uniformly on four tokens, two of
+        which the draft vocabulary keeps. The reachable mass is then 1/2, and
+        acceptance can never exceed that. Renormalizing over the kept tokens --
+        what the pruned path used to do -- would report a teacher summing to 1
+        and an acceptance ceiling of 1, hiding exactly the cost of pruning.
+        """
+        pruned, model = _build(DRAFT_VOCAB_SIZE)
+        t2d, d2t = _mapping()
+        pruned.install_vocab_mapping(t2d, d2t)
+
+        kept = torch.nonzero(t2d, as_tuple=False).flatten().tolist()
+        dropped = [t for t in range(VOCAB_SIZE) if t not in set(kept)]
+        favoured = [kept[0], kept[1], dropped[0], dropped[1]]
+
+        # logit_v = weight[v, 0] once the teacher state is the first basis
+        # vector, so the target distribution is set directly.
+        with torch.no_grad():
+            model.lm_head.weight.fill_(0.0)
+            model.lm_head.weight[:, 0] = -50.0
+            for token in favoured:
+                model.lm_head.weight[token, 0] = 0.0
+
+        batch = _inputs()
+        teacher_state = torch.zeros(1, SEQ, HIDDEN)
+        teacher_state[:, :, 0] = 1.0
+        batch["target_last_hidden_states"] = teacher_state
+
+        _loss, _accuracy, metrics = model(**batch)
+        ratios = metrics["ratio_metrics"]
+
+        kept_mass_num, eval_den = ratios["teacher_kept_mass"]
+        kept_mass = float(kept_mass_num) / float(eval_den)
+        self.assertAlmostEqual(kept_mass, 0.5, places=3)
+
+        # tau counts the anchor token plus the expected accepted suffix, and
+        # every suffix step is capped by the reachable mass.
+        tau_num, tau_den = ratios["tau_probabilistic"]
+        tau = float(tau_num) / float(tau_den)
+        self.assertLessEqual(tau, 1.0 + BLOCK * kept_mass + 1e-4)
+
+    def test_full_vocab_run_reports_no_kept_mass(self):
+        """Without pruning there is nothing to lose, so the metric is absent."""
+        _draft, model = _build(VOCAB_SIZE)
+        _loss, _accuracy, metrics = model(**_inputs())
+        self.assertNotIn("teacher_kept_mass", metrics["ratio_metrics"])
 
     def test_loading_a_conflicting_mapping_is_rejected(self):
         """The resume hazard: same K, different tokens, no error, wrong labels.
