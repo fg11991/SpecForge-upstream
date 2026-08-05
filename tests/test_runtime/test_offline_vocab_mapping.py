@@ -17,7 +17,7 @@ from specforge.training.assembly import (
     _install_dataset_vocab_mapping,
     _prompt_cache_key,
 )
-from specforge.training.vocab_mapping import count_effective_feature_tokens
+from specforge.data.vocab_mapping import count_effective_feature_tokens
 
 ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
 
