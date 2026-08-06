@@ -220,6 +220,11 @@ Common fields:
 | `training.learning_rate` | `1e-4` | Positive peak learning rate. |
 | `training.warmup_ratio` | `0.015` | Fraction in `[0, 1]` used for scheduler warmup. |
 | `training.max_grad_norm` | `0.5` | Positive gradient-clipping norm. |
+| `training.adam_beta1` | `0.9` | AdamW first-moment decay. |
+| `training.adam_beta2` | `0.999` | AdamW second-moment decay. `0.95` (GPT-3/LLaMA) shortens recovery from a gradient spike from ~1000 steps to ~20. |
+| `training.grad_spike_skip` | `off` | `off`, `observe`, or `on`. Discards an optimizer step whose gradient norm is a statistical outlier; clipping cannot do this, because it bounds the norm but not the direction and AdamW's step is nearly invariant to a global rescale. `observe` reports what would have been skipped without changing training — use it to check headroom on a new dataset first. |
+| `training.grad_spike_ratio` | `10.0` | Control limit as a multiple (> 1) of the running geometric-mean gradient norm. Dimensionless so it transfers across datasets and learning rates, which the absolute norm does not. |
+| `training.grad_spike_warmup_steps` | `500` | Optimizer steps excluded from the estimate, so the large and highly variable norms of freshly initialized weights do not raise the limit. |
 | `training.optimizer_cpu_offload` | `false` | Keep the optimizer's FP32 master parameters and Adam state on CPU. |
 | `training.attention_backend` | `flex_attention` | `eager`, `sdpa`, `flex_attention`, `fa`, or `usp`; the selected strategy must support it. |
 | `training.tp_size` | `1` | Online disaggregated consumers must keep it at 1; configure target TP on capture servers. Offline non-USP ranks consume disjoint data. |

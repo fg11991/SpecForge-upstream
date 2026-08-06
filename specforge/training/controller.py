@@ -596,6 +596,12 @@ class TrainerController:
                     get_learning_rate = getattr(optimizer, "get_learning_rate", None)
                     if callable(get_learning_rate):
                         log_metrics["lr"] = float(get_learning_rate())
+                    # Optimizer-owned diagnostics (gradient-spike guard). Empty
+                    # when the guard is off, so the logged key set of an
+                    # existing run does not change.
+                    get_diagnostics = getattr(optimizer, "get_diagnostics", None)
+                    if callable(get_diagnostics):
+                        log_metrics.update(get_diagnostics())
                     self.logger(log_metrics, self.global_step)
                 eval_metrics: Optional[Dict[str, Any]] = None
                 if eval_enabled and self.global_step % self.eval_interval == 0:

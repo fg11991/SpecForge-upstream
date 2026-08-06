@@ -490,6 +490,25 @@ class TrainingConfig(StrictConfigModel):
     learning_rate: float = Field(default=1e-4, gt=0.0)
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)
     max_grad_norm: float = Field(default=0.5, gt=0.0)
+    #: AdamW moment decays. beta2=0.95 (GPT-3/LLaMA) instead of PyTorch's 0.999
+    #: shortens recovery from a gradient spike that slips past the guard below
+    #: from ~1000 steps to ~20, at no cost to normal convergence.
+    adam_beta1: float = Field(default=0.9, gt=0.0, lt=1.0)
+    adam_beta2: float = Field(default=0.999, gt=0.0, lt=1.0)
+    #: Discard an optimizer step whose gradient norm is a statistical outlier.
+    #: Global norm clipping does not protect AdamW here -- it bounds the norm
+    #: but not the direction, and AdamW's per-parameter step is nearly
+    #: invariant to a global rescale. "observe" reports what would have been
+    #: skipped without changing training: use it to check the headroom on a new
+    #: dataset before switching to "on".
+    grad_spike_skip: Literal["off", "observe", "on"] = "off"
+    #: Control limit as a multiple of the running geometric-mean gradient norm.
+    #: Dimensionless on purpose: the absolute norm drifts several-fold within a
+    #: single run and further across datasets, the multiple does not.
+    grad_spike_ratio: float = Field(default=10.0, gt=1.0)
+    #: Optimizer steps excluded from the estimate, so that the large and highly
+    #: variable norms of freshly initialized weights do not raise the limit.
+    grad_spike_warmup_steps: int = Field(default=500, ge=0)
     #: Keep FP32 Adam masters and moments on CPU while the trainable draft
     #: remains on the accelerator.
     optimizer_cpu_offload: bool = False

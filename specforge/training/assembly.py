@@ -270,6 +270,10 @@ class _ConfiguredOptimizerFactory:
             warmup_ratio=t.warmup_ratio,
             total_steps=self.total_steps,
             offload_master=t.optimizer_cpu_offload,
+            betas=(t.adam_beta1, t.adam_beta2),
+            grad_spike_skip=t.grad_spike_skip,
+            grad_spike_ratio=t.grad_spike_ratio,
+            grad_spike_warmup_steps=t.grad_spike_warmup_steps,
         )
 
 

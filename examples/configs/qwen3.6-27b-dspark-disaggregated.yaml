@@ -21,6 +21,19 @@ training:
   learning_rate: 0.0006
   warmup_ratio: 0.04
   max_grad_norm: 1.0
+  # A recorded run of this recipe lost ~4000 steps of progress four times in
+  # 10480 steps: accuracy fell from 0.55 to 0.15 within ten steps and took
+  # 60-820 steps to climb back. Every onset coincided with a gradient norm of
+  # 5.6-30.1 against a healthy maximum of 1.5. max_grad_norm did not help --
+  # it bounds the norm, not the direction, and AdamW's per-parameter step is
+  # nearly invariant to a global rescale. On that run's grad-norm trace a limit
+  # of 10x the running geometric mean caught all four onsets and skipped none
+  # of the 858 healthy steps.
+  grad_spike_skip: "on"
+  grad_spike_ratio: 10.0
+  # beta2=0.999 gives exp_avg_sq a ~1000-step memory, which is what stretched
+  # each of those events into hundreds of steps of suppressed learning rate.
+  adam_beta2: 0.95
   num_anchors: 512
   loss_decay_gamma: 4.0
   objective_chunk_blocks: 128
