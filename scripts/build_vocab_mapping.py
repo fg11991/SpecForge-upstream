@@ -242,24 +242,48 @@ def count_dataset_tokens(args, *, vocab_size: int) -> Counter:
         minimum_valid_tokens=args.minimum_valid_tokens,
     )
     print(f"Tokenized {len(processed)} samples")
+    return tally_loss_tokens(processed, vocab_size=vocab_size)
 
-    counts: Counter = Counter()
-    for input_ids, loss_mask in zip(processed["input_ids"], processed["loss_mask"]):
-        input_ids = torch.as_tensor(input_ids).reshape(-1)
-        loss_mask = torch.as_tensor(loss_mask).reshape(-1)
-        selected = input_ids[loss_mask.to(dtype=torch.bool)]
-        if selected.numel() == 0:
+
+def tally_loss_tokens(dataset, *, vocab_size: int, batch_size: int = 512) -> Counter:
+    """Sum loss-bearing token frequencies over a tokenized dataset.
+
+    Streams batches rather than touching ``dataset["input_ids"]``: column access
+    materializes every sequence as Python ints at once, which for a corpus this
+    feature targets is tens of gigabytes and looks like a hang. Frequencies then
+    accumulate into one dense bincount per batch instead of per token, keeping
+    the work in tensors rather than in a billion-iteration Python loop.
+    """
+    from tqdm import tqdm
+
+    totals = torch.zeros(vocab_size, dtype=torch.int64)
+    batches = (len(dataset) + batch_size - 1) // batch_size
+    for batch in tqdm(
+        dataset.iter(batch_size=batch_size),
+        total=batches,
+        desc="Counting tokens for vocab mapping",
+    ):
+        selected = []
+        for input_ids, loss_mask in zip(batch["input_ids"], batch["loss_mask"]):
+            ids = torch.as_tensor(input_ids).reshape(-1)
+            mask = torch.as_tensor(loss_mask).reshape(-1)
+            kept = ids[mask.to(dtype=torch.bool)]
+            if kept.numel():
+                selected.append(kept)
+        if not selected:
             continue
-        token_ids, frequencies = selected.unique(return_counts=True)
-        for token_id, frequency in zip(token_ids.tolist(), frequencies.tolist()):
-            token_id = int(token_id)
-            if not 0 <= token_id < vocab_size:
-                raise ValueError(
-                    f"token id {token_id} is outside the draft config's "
-                    f"vocab_size {vocab_size}"
-                )
-            counts[token_id] += int(frequency)
-    return counts
+        flat = torch.cat(selected).long()
+        if int(flat.min()) < 0 or int(flat.max()) >= vocab_size:
+            raise ValueError(
+                f"token id {int(flat.max())} is outside the draft config's "
+                f"vocab_size {vocab_size}"
+            )
+        totals += torch.bincount(flat, minlength=vocab_size)
+
+    present = torch.nonzero(totals, as_tuple=False).flatten()
+    return Counter(
+        {int(token): int(totals[token]) for token in present.tolist()}
+    )
 
 
 def load_or_count_tokens(args, *, vocab_size: int, counts_cache: Path) -> Counter:

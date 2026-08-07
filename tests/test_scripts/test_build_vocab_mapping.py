@@ -250,6 +250,62 @@ class BuildVocabMappingTest(unittest.TestCase):
         self.assertEqual(1, len(calls), "the corpus was tokenized twice")
         self.assertEqual(first, second)
 
+    def test_tally_counts_only_loss_bearing_tokens(self):
+        from datasets import Dataset
+
+        from scripts.build_vocab_mapping import tally_loss_tokens
+
+        dataset = Dataset.from_dict(
+            {
+                "input_ids": [[5, 7, 5, 9], [5, 200], [11, 11]],
+                "loss_mask": [[1, 1, 1, 0], [0, 1], [0, 0]],
+            }
+        )
+        counts = tally_loss_tokens(dataset, vocab_size=VOCAB_SIZE, batch_size=2)
+
+        # 9 is masked out, 11 is entirely masked, 5 appears twice in row 0.
+        self.assertEqual(Counter({5: 2, 7: 1, 200: 1}), counts)
+
+    def test_tally_never_materializes_a_whole_column(self):
+        """Column access loads every sequence as Python ints; at scale that hangs."""
+        from datasets import Dataset
+
+        from scripts.build_vocab_mapping import tally_loss_tokens
+
+        dataset = Dataset.from_dict(
+            {
+                "input_ids": [[1, 2], [3, 4]],
+                "loss_mask": [[1, 1], [1, 1]],
+            }
+        )
+        original = Dataset.__getitem__
+        column_reads = []
+
+        def tracking_getitem(self, key):
+            if isinstance(key, str):
+                column_reads.append(key)
+            return original(self, key)
+
+        Dataset.__getitem__ = tracking_getitem
+        try:
+            counts = tally_loss_tokens(dataset, vocab_size=VOCAB_SIZE, batch_size=1)
+        finally:
+            Dataset.__getitem__ = original
+
+        self.assertEqual([], column_reads, f"read whole columns: {column_reads}")
+        self.assertEqual(Counter({1: 1, 2: 1, 3: 1, 4: 1}), counts)
+
+    def test_tally_rejects_ids_outside_the_vocabulary(self):
+        from datasets import Dataset
+
+        from scripts.build_vocab_mapping import tally_loss_tokens
+
+        dataset = Dataset.from_dict(
+            {"input_ids": [[VOCAB_SIZE]], "loss_mask": [[1]]}
+        )
+        with self.assertRaisesRegex(ValueError, "outside the draft config"):
+            tally_loss_tokens(dataset, vocab_size=VOCAB_SIZE)
+
     def test_coverage_ratio_matches_the_definition(self):
         counts = Counter({0: 90, 1: 9, 2: 1})
         self.assertAlmostEqual(0.9, coverage_ratio(counts, 1))
