@@ -171,6 +171,85 @@ class BuildVocabMappingTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "draft_vocab_size must be"):
                     self._run("--draft-vocab-size", bad)
 
+    def test_data_path_requires_the_capture_settings(self):
+        """A JSONL source that guesses the tokenization describes another corpus."""
+        _write_draft_config(self.config, DRAFT_VOCAB_SIZE)
+        jsonl = self.root / "train.jsonl"
+        jsonl.write_text("{}\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "must reproduce the capture"):
+            main(
+                [
+                    "--data-path",
+                    str(jsonl),
+                    "--draft-model-config",
+                    str(self.config),
+                ]
+            )
+
+    def test_the_two_sources_are_mutually_exclusive(self):
+        _write_draft_config(self.config, DRAFT_VOCAB_SIZE)
+        with self.assertRaises(SystemExit):
+            main(
+                [
+                    "--hidden-states-path",
+                    str(self.features),
+                    "--data-path",
+                    str(self.root / "train.jsonl"),
+                    "--draft-model-config",
+                    str(self.config),
+                ]
+            )
+
+    def test_a_source_is_required(self):
+        _write_draft_config(self.config, DRAFT_VOCAB_SIZE)
+        with self.assertRaises(SystemExit):
+            main(["--draft-model-config", str(self.config)])
+
+    def test_dataset_counts_are_cached_under_the_dataset_cache_dir(self):
+        """The JSONL route caches too, so surveying K stays a one-time cost."""
+        from types import SimpleNamespace
+
+        from scripts.build_vocab_mapping import load_or_count_tokens
+
+        cache = self.root / "counts.pt"
+        args = SimpleNamespace(
+            hidden_states_path=None,
+            data_path=self.root / "train.jsonl",
+            tokenizer_path="tok",
+            chat_template="qwen",
+            max_length=128,
+            is_preformatted=False,
+            minimum_valid_tokens=None,
+            num_samples=None,
+            build_dataset_num_proc=1,
+            dataset_cache_dir=self.root,
+            recount=False,
+        )
+        args.data_path.write_text("{}\n", encoding="utf-8")
+
+        calls = []
+
+        def fake_count(_args, *, vocab_size):
+            calls.append(vocab_size)
+            return Counter({0: 5, 2: 3})
+
+        import scripts.build_vocab_mapping as module
+
+        original = module.count_dataset_tokens
+        module.count_dataset_tokens = fake_count
+        try:
+            first = load_or_count_tokens(
+                args, vocab_size=VOCAB_SIZE, counts_cache=cache
+            )
+            second = load_or_count_tokens(
+                args, vocab_size=VOCAB_SIZE, counts_cache=cache
+            )
+        finally:
+            module.count_dataset_tokens = original
+
+        self.assertEqual(1, len(calls), "the corpus was tokenized twice")
+        self.assertEqual(first, second)
+
     def test_coverage_ratio_matches_the_definition(self):
         counts = Counter({0: 90, 1: 9, 2: 1})
         self.assertAlmostEqual(0.9, coverage_ratio(counts, 1))

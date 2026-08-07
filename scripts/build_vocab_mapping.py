@@ -16,19 +16,28 @@ the model's ``t2d`` buffer is registered with. Sizing it from the target config
 instead would produce a file that silently fails to load whenever the target
 declares ``padded_vocab_size``.
 
+Two sources, same numbers. ``--hidden-states-path`` reads the prepared
+features, which is exact but serial -- for a large gzipped dataset it is not
+merely slow, it is impractical, since every file is decompressed in full to
+recover two small tensors. ``--data-path`` re-tokenizes the source JSONL with
+the same stack the capture used, in parallel, without touching the features at
+all; pass it the same tokenizer, template, max length, and filters.
+
 Survey several sizes before committing to one (writes nothing):
 
     python scripts/build_vocab_mapping.py \
-        --hidden-states-path ./cache/hidden_states/qwen3.6-27b-dspark \
+        --data-path ./cache/dataset/train.jsonl \
+        --tokenizer-path Qwen/Qwen3-8B --chat-template qwen --max-length 4096 \
         --draft-model-config configs/qwen3.6-27b-dspark.json \
         --draft-vocab-size 16000,32000,48000,64000
 
 Then write the chosen one, reusing the cached counts:
 
     python scripts/build_vocab_mapping.py \
-        --hidden-states-path ./cache/hidden_states/qwen3.6-27b-dspark \
-        --draft-model-config configs/qwen3.6-27b-dspark-draftvocab32k.json \
-        --output-path ./cache/vocab_mapping/qwen3.6-27b-k32000.pt
+        --data-path ./cache/dataset/train.jsonl \
+        --tokenizer-path Qwen/Qwen3-8B --chat-template qwen --max-length 4096 \
+        --draft-model-config configs/qwen3.6-27b-dspark-draftvocab64k.json \
+        --output-path ./cache/vocab_mapping/qwen3.6-27b-k64000.pt
 """
 
 from __future__ import annotations
@@ -51,11 +60,68 @@ def build_parser() -> argparse.ArgumentParser:
             "regenerating them and without a second pass per vocabulary size."
         )
     )
-    parser.add_argument(
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
         "--hidden-states-path",
         type=Path,
-        required=True,
-        help="Directory of prepared offline features (.ckpt / .ckpt.gz).",
+        help=(
+            "Directory of prepared offline features (.ckpt / .ckpt.gz). Exact, "
+            "but reads every file serially -- impractical for a large gzipped "
+            "dataset; prefer --data-path there."
+        ),
+    )
+    source.add_argument(
+        "--data-path",
+        type=Path,
+        help=(
+            "Raw conversation JSONL. Re-tokenizes with the same stack "
+            "prepare_hidden_states.py uses, in parallel and without touching "
+            "the features at all. Pass the same tokenizer/template/max-length "
+            "and --minimum-valid-tokens the capture ran with, or the counts "
+            "will describe a different corpus than training sees."
+        ),
+    )
+    parser.add_argument(
+        "--tokenizer-path",
+        default=None,
+        help="Target model/tokenizer path. Required with --data-path.",
+    )
+    parser.add_argument(
+        "--chat-template",
+        default=None,
+        help="Chat template used at capture time. Required with --data-path.",
+    )
+    parser.add_argument(
+        "--is-preformatted",
+        action="store_true",
+        help="Source rows already have the chat template applied.",
+    )
+    parser.add_argument(
+        "--minimum-valid-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Mirror prepare_hidden_states.py's filter so dropped samples do "
+            "not contribute frequencies."
+        ),
+    )
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=None,
+        help="Mirror prepare_hidden_states.py's --num-samples.",
+    )
+    parser.add_argument(
+        "--build-dataset-num-proc",
+        type=int,
+        default=8,
+        help="Tokenization worker processes for --data-path.",
+    )
+    parser.add_argument(
+        "--dataset-cache-dir",
+        type=Path,
+        default=Path("./cache"),
+        help="Tokenized-dataset cache root, matching data.cache_dir.",
     )
     parser.add_argument(
         "--draft-model-config",
@@ -120,33 +186,110 @@ def _feature_identity(hidden_states_path: str, max_length: Optional[int]) -> str
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def load_or_count_tokens(
-    *,
-    hidden_states_path: str,
-    target_vocab_size: int,
-    max_length: Optional[int],
-    counts_cache: Path,
-    recount: bool,
-) -> Counter:
-    """Return loss-bearing token frequencies, reading the features at most once."""
-    identity = _feature_identity(hidden_states_path, max_length)
-    if not recount and counts_cache.exists():
+def _dataset_identity(args, vocab_size: int) -> str:
+    """Fingerprint the tokenization inputs, so a cache answers for its own corpus."""
+    stat = os.stat(args.data_path)
+    payload = json.dumps(
+        {
+            "kind": "conversations-jsonl-v1",
+            "path": os.path.abspath(args.data_path),
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "tokenizer": args.tokenizer_path,
+            "chat_template": args.chat_template,
+            "max_length": args.max_length,
+            "is_preformatted": bool(args.is_preformatted),
+            "minimum_valid_tokens": args.minimum_valid_tokens,
+            "num_samples": args.num_samples,
+            "vocab_size": vocab_size,
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def count_dataset_tokens(args, *, vocab_size: int) -> Counter:
+    """Count loss-bearing tokens by re-tokenizing the source conversations.
+
+    Runs the same tokenizer, chat template, truncation, and trainable-token
+    filter that ``prepare_hidden_states.py`` applied, so the frequencies match
+    the captured features without reading them. Any of those knobs differing
+    from the capture yields a mapping for a different corpus, which is why they
+    are all explicit rather than defaulted.
+    """
+    from datasets import Dataset
+
+    from specforge.data.preprocessing import build_eagle3_dataset
+    from specforge.utils import load_tokenizer, safe_conversations_generator
+
+    tokenizer = load_tokenizer(args.tokenizer_path)
+    dataset = Dataset.from_generator(
+        generator=safe_conversations_generator,
+        gen_kwargs={"file_path": str(args.data_path)},
+        num_proc=min(args.build_dataset_num_proc, 32),
+    )
+    if args.num_samples is not None:
+        dataset = dataset.select(range(args.num_samples))
+    processed = build_eagle3_dataset(
+        dataset=dataset,
+        tokenizer=tokenizer,
+        chat_template=args.chat_template,
+        max_length=args.max_length,
+        cache_dir=str(args.dataset_cache_dir / "processed_dataset"),
+        cache_key=_dataset_identity(args, vocab_size),
+        is_preformatted=args.is_preformatted,
+        num_proc=args.build_dataset_num_proc,
+        minimum_valid_tokens=args.minimum_valid_tokens,
+    )
+    print(f"Tokenized {len(processed)} samples")
+
+    counts: Counter = Counter()
+    for input_ids, loss_mask in zip(processed["input_ids"], processed["loss_mask"]):
+        input_ids = torch.as_tensor(input_ids).reshape(-1)
+        loss_mask = torch.as_tensor(loss_mask).reshape(-1)
+        selected = input_ids[loss_mask.to(dtype=torch.bool)]
+        if selected.numel() == 0:
+            continue
+        token_ids, frequencies = selected.unique(return_counts=True)
+        for token_id, frequency in zip(token_ids.tolist(), frequencies.tolist()):
+            token_id = int(token_id)
+            if not 0 <= token_id < vocab_size:
+                raise ValueError(
+                    f"token id {token_id} is outside the draft config's "
+                    f"vocab_size {vocab_size}"
+                )
+            counts[token_id] += int(frequency)
+    return counts
+
+
+def load_or_count_tokens(args, *, vocab_size: int, counts_cache: Path) -> Counter:
+    """Return loss-bearing token frequencies, counting at most once per corpus."""
+    from_features = args.hidden_states_path is not None
+    identity = (
+        _feature_identity(str(args.hidden_states_path), args.max_length)
+        if from_features
+        else _dataset_identity(args, vocab_size)
+    )
+    if not args.recount and counts_cache.exists():
         cached = torch.load(counts_cache, map_location="cpu", weights_only=False)
         if cached.get("identity") == identity:
             print(f"Reusing token counts from {counts_cache}")
             return Counter(cached["counts"])
-        print(
-            f"{counts_cache} was built from different feature files; recounting."
+        print(f"{counts_cache} describes a different corpus; recounting.")
+
+    if from_features:
+        from specforge.data.vocab_mapping import count_effective_feature_tokens
+
+        print(f"Counting loss-bearing tokens under {args.hidden_states_path} ...")
+        counts = count_effective_feature_tokens(
+            str(args.hidden_states_path),
+            max_length=args.max_length,
+            target_vocab_size=vocab_size,
         )
+    else:
+        print(f"Tokenizing {args.data_path} to count loss-bearing tokens ...")
+        counts = count_dataset_tokens(args, vocab_size=vocab_size)
 
-    from specforge.data.vocab_mapping import count_effective_feature_tokens
-
-    print(f"Counting loss-bearing tokens under {hidden_states_path} ...")
-    counts = count_effective_feature_tokens(
-        hidden_states_path,
-        max_length=max_length,
-        target_vocab_size=target_vocab_size,
-    )
     counts_cache.parent.mkdir(parents=True, exist_ok=True)
     temporary = counts_cache.with_suffix(f".{os.getpid()}.tmp")
     torch.save({"identity": identity, "counts": dict(counts)}, temporary)
@@ -217,15 +360,30 @@ def main(argv=None) -> int:
             "--output-path writes a single mapping; pass one --draft-vocab-size"
         )
 
-    counts_cache = args.counts_cache or (
-        args.hidden_states_path / ".token_counts.pt"
-    )
+    if args.data_path is not None:
+        missing = [
+            name
+            for name, value in (
+                ("--tokenizer-path", args.tokenizer_path),
+                ("--chat-template", args.chat_template),
+                ("--max-length", args.max_length),
+            )
+            if value is None
+        ]
+        if missing:
+            raise ValueError(
+                f"--data-path re-tokenizes the corpus and must reproduce the "
+                f"capture exactly; missing {missing}"
+            )
+
+    if args.counts_cache is not None:
+        counts_cache = args.counts_cache
+    elif args.hidden_states_path is not None:
+        counts_cache = args.hidden_states_path / ".token_counts.pt"
+    else:
+        counts_cache = args.dataset_cache_dir / "vocab_mapping" / ".token_counts.pt"
     counts = load_or_count_tokens(
-        hidden_states_path=str(args.hidden_states_path),
-        target_vocab_size=vocab_size,
-        max_length=args.max_length,
-        counts_cache=counts_cache,
-        recount=args.recount,
+        args, vocab_size=vocab_size, counts_cache=counts_cache
     )
     distinct = len(counts)
     print(f"Distinct loss-bearing tokens: {distinct} of {vocab_size}")
