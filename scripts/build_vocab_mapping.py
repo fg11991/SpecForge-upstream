@@ -121,7 +121,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--dataset-cache-dir",
         type=Path,
         default=Path("./cache"),
-        help="Tokenized-dataset cache root, matching data.cache_dir.",
+        help=(
+            "Root for the conversation and tokenized-dataset caches "
+            "(<root>/hf_dataset and <root>/processed_dataset). Point it at a "
+            "partition with room; matching data.cache_dir lets a later "
+            "training run reuse the tokenization."
+        ),
     )
     parser.add_argument(
         "--draft-model-config",
@@ -159,8 +164,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "Token-count cache (default: <hidden-states-path>/.token_counts.pt). "
-            "Reused only when the feature files are unchanged."
+            "Token-count cache. Defaults to <hidden-states-path>/.token_counts.pt "
+            "for --hidden-states-path, and "
+            "<dataset-cache-dir>/vocab_mapping/.token_counts.pt for --data-path. "
+            "Reused only when the corpus fingerprint is unchanged."
         ),
     )
     parser.add_argument(
@@ -226,6 +233,10 @@ def count_dataset_tokens(args, *, vocab_size: int) -> Counter:
     dataset = Dataset.from_generator(
         generator=safe_conversations_generator,
         gen_kwargs={"file_path": str(args.data_path)},
+        # Pinned under --dataset-cache-dir like prepare_hidden_states.py does.
+        # Left to its default this lands in ~/.cache/huggingface, which is
+        # rarely the partition with room for a 600k-conversation corpus.
+        cache_dir=str(args.dataset_cache_dir / "hf_dataset"),
         num_proc=min(args.build_dataset_num_proc, 32),
     )
     if args.num_samples is not None:
