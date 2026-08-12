@@ -17,6 +17,9 @@ INKLING_TWO_NODE = ROOT / "examples" / "disagg" / "run_inkling_dspark_disagg_2no
 KIMI_K3_CAPTURE_PATCH = (
     ROOT / "patches" / "sglang" / "kimi-k3-f8493a4" / "spec-capture.patch"
 )
+V0514_CAPTURE_PATCH = (
+    ROOT / "patches" / "sglang" / "v0.5.14" / "spec-capture.patch"
+)
 
 
 class DisaggregatedWrapperTest(unittest.TestCase):
@@ -143,6 +146,14 @@ class DisaggregatedWrapperTest(unittest.TestCase):
         self.assertIn('getattr(store, "batch_put_from", None)', source)
         self.assertIn("SGLANG_SPEC_CAPTURE_MAX_PENDING_BATCHES", source)
         self.assertIn("req.finished() and req.spec_capture_result is None", source)
+
+    def test_v0514_patch_embeds_the_ascend_cpu_mount_path(self):
+        source = V0514_CAPTURE_PATCH.read_text(encoding="utf-8")
+        self.assertIn('os.environ.get("ASCEND_RT_VISIBLE_DEVICES")', source)
+        self.assertIn('os.environ.get("ASCEND_VISIBLE_DEVICES")', source)
+        self.assertIn('mount(segment_to_mount, protocol, "cpu")', source)
+        self.assertIn("global_segment_size = 0", source)
+        self.assertIn("local_buffer_size = 0", source)
 
     def test_two_node_wrapper_keeps_training_on_the_unified_cli(self):
         self.assertTrue(os.access(TWO_NODE, os.X_OK))

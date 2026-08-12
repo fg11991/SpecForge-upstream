@@ -155,7 +155,18 @@ def _connect_store(setup_kwargs: Dict[str, Any]) -> Tuple[Any, Any]:
     setup_kwargs = dict(setup_kwargs)
     if _ascend_runtime_available():
         # Ascend rejects the wildcard-location staging-buffer registration
-        # ("location:* is not supported"); zero-copy clients can drop it.
+        # ("location:* is not supported"); zero-copy clients can drop it. This
+        # does not resize the resource-owning capture-server segment, which is
+        # mounted explicitly at location="cpu" by the SGLang capture patch.
+        configured_local_buffer_size = setup_kwargs.get("local_buffer_size")
+        if configured_local_buffer_size not in (None, 0):
+            logger.warning(
+                "Ascend Mooncake ignores configured local_buffer_size=%s and "
+                "uses 0 to avoid unsupported wildcard-location registration; "
+                "the capture-server global segment and SpecForge flow-control "
+                "watermarks are unchanged",
+                configured_local_buffer_size,
+            )
         setup_kwargs["local_buffer_size"] = 0
     store = MooncakeDistributedStore()
     rc = store.setup(**setup_kwargs)

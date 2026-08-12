@@ -182,6 +182,7 @@ def build_eagle3_dataset(
     train_only_last_turn: Optional[bool] = False,
     minimum_valid_tokens: Optional[int] = None,
     loss_mask_filter: Optional[Callable[[object], bool]] = None,
+    candidate_samples: Optional[int] = None,
 ) -> HFDataset:
     """
     build eagle3 dataset
@@ -210,6 +211,10 @@ def build_eagle3_dataset(
         minimum_valid_tokens: If set, drops samples with fewer trainable tokens.
         loss_mask_filter: Optional algorithm-owned predicate applied after
                           tokenization and truncation.
+        candidate_samples: Optional upper bound applied after the normal
+                           deterministic shuffle and before tokenization. This
+                           is intended for bounded smoke tests; omitting it
+                           preserves full-corpus filter semantics.
 
     Returns:
         The processed HF dataset.
@@ -218,6 +223,11 @@ def build_eagle3_dataset(
         raise ValueError("minimum_valid_tokens must be >= 0")
     if loss_mask_filter is not None and not callable(loss_mask_filter):
         raise TypeError("loss_mask_filter must be callable or None")
+    if candidate_samples is not None:
+        if candidate_samples < 1:
+            raise ValueError("candidate_samples must be >= 1")
+        if loss_mask_filter is None:
+            raise ValueError("candidate_samples requires loss_mask_filter")
 
     # Validate chat_template requirement
     if chat_template is None:
@@ -230,6 +240,8 @@ def build_eagle3_dataset(
     template: ChatTemplate = TEMPLATE_REGISTRY.get(chat_template)
 
     dataset = dataset.shuffle(seed=shuffle_seed)
+    if candidate_samples is not None:
+        dataset = dataset.select(range(min(candidate_samples, len(dataset))))
     original_cols = dataset.column_names
 
     def preprocess_function(examples):

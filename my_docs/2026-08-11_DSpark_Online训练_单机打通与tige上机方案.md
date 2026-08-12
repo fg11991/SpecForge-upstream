@@ -6,6 +6,14 @@
 
 本文是上面那份方案的**执行结果**(第一部分)和**下一步计划**(第二、三部分)。
 
+> **2026-08-12 / `0812_upstream` 更新：**第一部分的 `dflash` 和 1 GiB local
+> buffer 命令是 `068009f` 当时的历史实测记录，不要原样用于新分支。当前
+> SpecForge 必须配套当前 v0.5.14 patch，并使用
+> `--spec-capture-method dspark`；Ascend 的 local staging buffer 设为 0，真实
+> feature 容量由显式 CPU mount 的 global segment 承担。完整的旧 patch 卸载、
+> 新 patch 应用、TTL 探测与兼容矩阵见
+> [`2026-08-12_0812_upstream_组合风险核实与修复.md`](2026-08-12_0812_upstream_组合风险核实与修复.md)。
+
 ---
 
 # 第一部分:单机已打通(Qwen3-8B)
@@ -58,7 +66,7 @@ mooncake_master --enable_http_metadata_server=true --http_metadata_server_host=1
 **② patched sglang capture server**(`MOONCAKE_*` 必须写在启动这一行,sink 在子进程读 `os.environ`,起来后再改无效)
 
 ```bash
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 MOONCAKE_LOCAL_HOSTNAME=127.0.0.1 MOONCAKE_METADATA_SERVER=http://127.0.0.1:35880/metadata MOONCAKE_MASTER_SERVER_ADDR=127.0.0.1:35551 MOONCAKE_PROTOCOL=tcp MOONCAKE_GLOBAL_SEGMENT_SIZE=34359738368 MOONCAKE_LOCAL_BUFFER_SIZE=1073741824 python -m sglang.launch_server --model-path /opt/foundation_model/Qwen3-8B/ --dtype bfloat16 --trust-remote-code --skip-tokenizer-init --tp-size 4 --chunked-prefill-size -1 --disable-radix-cache --enable-spec-capture --spec-capture-method dflash --spec-capture-aux-layer-ids 1 9 17 25 33 --attention-backend ascend --context-length 4103 --mem-fraction-static 0.8 --host 127.0.0.1 --port 30000
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 MOONCAKE_LOCAL_HOSTNAME=127.0.0.1 MOONCAKE_METADATA_SERVER=http://127.0.0.1:35880/metadata MOONCAKE_MASTER_SERVER_ADDR=127.0.0.1:35551 MOONCAKE_PROTOCOL=tcp MOONCAKE_GLOBAL_SEGMENT_SIZE=34359738368 MOONCAKE_LOCAL_BUFFER_SIZE=0 python -m sglang.launch_server --model-path /opt/foundation_model/Qwen3-8B/ --dtype bfloat16 --trust-remote-code --skip-tokenizer-init --tp-size 4 --chunked-prefill-size -1 --disable-radix-cache --enable-spec-capture --spec-capture-method dspark --spec-capture-aux-layer-ids 1 9 17 25 33 --attention-backend ascend --context-length 4103 --mem-fraction-static 0.8 --host 127.0.0.1 --port 30000
 ```
 
 不能改的四项:`--skip-tokenizer-init`(producer 直送 input_ids)、`--chunked-prefill-size -1`(采集拒绝分块 prefill,scheduler 里有硬校验)、`--context-length ≥ max_length + 7`、`--spec-capture-aux-layer-ids` 必须等于 draft config 的 `dflash_config.target_layer_ids`。
@@ -265,7 +273,9 @@ while [[ ! -f "$RUN_ROOT/.mooncake_ready" ]]; do sleep 3; done
 source "$RUN_ROOT/mooncake.env"
 export MOONCAKE_LOCAL_HOSTNAME="$MY_IP"
 export MOONCAKE_GLOBAL_SEGMENT_SIZE=34359738368
-export MOONCAKE_LOCAL_BUFFER_SIZE=1073741824
+# Ascend 不支持 wildcard-location local staging buffer；当前主 patch 会把
+# global segment 显式 mount 到 location=cpu。
+export MOONCAKE_LOCAL_BUFFER_SIZE=0
 export GDN_ATTN_BACKEND_TRITON=1
 
 # --- 每节点起 SERVERS_PER_NODE 个 TP=4 server ---
@@ -276,7 +286,7 @@ for i in $(seq 0 $((SERVERS_PER_NODE-1))); do
     --model-path "$TARGET" --dtype bfloat16 --trust-remote-code \
     --skip-tokenizer-init --tp-size 4 \
     --chunked-prefill-size -1 --disable-radix-cache \
-    --enable-spec-capture --spec-capture-method dflash \
+    --enable-spec-capture --spec-capture-method dspark \
     --spec-capture-aux-layer-ids $AUX_IDS \
     --attention-backend ascend --context-length $((MAX_LENGTH+7)) \
     --mem-fraction-static 0.8 --host 0.0.0.0 --port "$port" \

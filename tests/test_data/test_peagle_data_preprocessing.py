@@ -105,6 +105,58 @@ class TestPEagleDataPreprocessing(unittest.TestCase):
                 minimum_valid_tokens=-1,
             )
 
+    def test_smoke_candidates_are_selected_before_tokenization(self):
+        class TrackingDataset:
+            column_names = ["conversations"]
+
+            def __init__(self):
+                self.events = []
+                self.length = 600_000
+
+            def __len__(self):
+                return self.length
+
+            def shuffle(self, *, seed):
+                self.events.append(("shuffle", seed))
+                return self
+
+            def select(self, indices):
+                indices = list(indices)
+                self.events.append(("select", len(indices)))
+                self.length = len(indices)
+                return self
+
+            def map(self, _fn, **_kwargs):
+                self.events.append(("map", self.length))
+                return self
+
+            def filter(self, _fn, **_kwargs):
+                self.events.append(("filter", self.length))
+                return self
+
+            def set_format(self, *, type):
+                self.events.append(("set_format", type))
+
+        dataset = TrackingDataset()
+        result = build_eagle3_dataset(
+            dataset=dataset,
+            tokenizer=DummyTokenizer(),
+            chat_template=self.template_name,
+            shuffle_seed=42,
+            num_proc=1,
+            cache_dir=None,
+            cache_key=None,
+            loss_mask_filter=lambda _mask: True,
+            candidate_samples=10_000,
+        )
+
+        self.assertIs(result, dataset)
+        self.assertEqual(
+            dataset.events[:3],
+            [("shuffle", 42), ("select", 10_000), ("map", 10_000)],
+        )
+        self.assertIn(("filter", 10_000), dataset.events)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

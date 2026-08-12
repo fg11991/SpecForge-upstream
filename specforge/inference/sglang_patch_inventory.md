@@ -12,7 +12,7 @@ Online training uses one of these source-specific patches:
 
 | Target | Patch | Capture methods |
 |---|---|---|
-| SGLang v0.5.14 / `inkling-support` | [`patches/sglang/v0.5.14/spec-capture.patch`](../../patches/sglang/v0.5.14/spec-capture.patch) | EAGLE3, DFlash, DSpark |
+| SGLang v0.5.14 / `inkling-support` (CUDA, ROCm, and Ascend) | [`patches/sglang/v0.5.14/spec-capture.patch`](../../patches/sglang/v0.5.14/spec-capture.patch) | EAGLE3, DFlash, DSpark |
 | Kimi K3 SGLang `9acd9cb` (`f8493a4` compatible) | [`patches/sglang/kimi-k3-f8493a4/spec-capture.patch`](../../patches/sglang/kimi-k3-f8493a4/spec-capture.patch) | EAGLE3, DFlash, DSpark |
 
 The patch adds `--enable-spec-capture` and a server-side sink that:
@@ -58,6 +58,19 @@ the same multiplier into the frozen target head used during training.
 Apply the default patch with `scripts/apply_sglang_spec_capture_patch.sh`, or
 the K3 patch with
 `scripts/apply_sglang_spec_capture_patch.sh --target kimi-k3-9acd9cb`.
+The default patch includes the Ascend Mooncake mount path: when either Ascend
+visibility variable is present, the sink calls `store.setup()` with zero
+wildcard buffers and explicitly mounts `MOONCAKE_GLOBAL_SEGMENT_SIZE` at
+`location="cpu"`.  There is no second Ascend overlay to apply.  This keeps the
+configured global segment capacity while avoiding the transfer engine's
+unsupported `location:*` registration on Ascend.
+
+When upgrading an already patched installation, reverse the exact patch text
+that was originally applied before applying the current patch.  In particular,
+the current patch cannot safely be used to reverse a tree carrying the older
+`068009f` patch: the asynchronous sink changed substantially.  The deployment
+runbook is recorded in
+[`my_docs/2026-08-12_0812_upstream_组合风险核实与修复.md`](../../my_docs/2026-08-12_0812_upstream_组合风险核实与修复.md).
 On the default patch, `--spec-capture-method dspark` rides the DFlash aux
 plumbing (`set_dflash_layers_to_capture`), which both stock v0.5.14 targets
 and `inkling-support`'s Inkling model implement; DSpark and DFlash capture
@@ -87,6 +100,12 @@ This package computes no logits and supports text EAGLE3, DFlash, Domino, and
 K3 DSpark state capture needed by the preprocessing script. It does not provide
 HF/custom backends, VLM capture, online rollout, or a general target-engine
 factory.
+
+For stock v0.5.14 targets that expose only
+`set_dflash_layers_to_capture`, offline DSpark capture falls back to that hook
+with a warning.  A target's native `set_dspark_layers_to_capture` remains the
+first choice, and the backend still fails before capture when neither hook is
+available.
 
 `tests/test_runtime/test_sglang_0514_compat.py` guards the patched 0.5.14 API
 seams, and

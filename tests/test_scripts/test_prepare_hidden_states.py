@@ -37,6 +37,7 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
 
         self.assertEqual("eagle3", args.strategy)
         self.assertIsNone(args.draft_model_config)
+        self.assertIsNone(args.filter_candidate_samples)
         self.assertFalse(args.sglang_disable_radix_cache)
         self.assertFalse(hasattr(args, "draft_num_hidden_layers"))
         self.assertFalse(hasattr(args, "draft_block_size"))
@@ -160,6 +161,40 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
             loss_mask_filter,
             build_dataset.call_args.kwargs["loss_mask_filter"],
         )
+
+    def test_dataset_build_bounds_smoke_candidates_before_tokenization(self):
+        argv = [
+            "prepare_hidden_states.py",
+            "--target-model-path",
+            "target",
+            "--data-path",
+            "data.jsonl",
+            "--num-samples",
+            "32",
+            "--filter-candidate-samples",
+            "256",
+        ]
+        with mock.patch("sys.argv", argv):
+            args = parse_args()
+
+        loss_mask_filter = mock.Mock(return_value=True)
+        with (
+            mock.patch(
+                "scripts.prepare_hidden_states.rank_0_priority",
+                new=contextlib.nullcontext,
+            ),
+            mock.patch(
+                "scripts.prepare_hidden_states.build_eagle3_dataset"
+            ) as build_dataset,
+        ):
+            build_processed_dataset(
+                args,
+                mock.sentinel.dataset,
+                mock.sentinel.tokenizer,
+                loss_mask_filter=loss_mask_filter,
+            )
+
+        self.assertEqual(256, build_dataset.call_args.kwargs["candidate_samples"])
 
     def test_strategy_capture_plans_use_draft_owned_layers_and_schemas(self):
         expected = {

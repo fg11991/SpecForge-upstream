@@ -252,6 +252,7 @@ EXPECTED_DISAGGREGATED = {
             ],
             "mooncake": {
                 "global_segment_size_bytes": 17179869184,
+                "default_kv_lease_ttl_ms": None,
             },
             "capture_servers": [
                 {

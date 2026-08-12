@@ -770,18 +770,32 @@ index 0000000..d54b920
 +            from mooncake.store import MooncakeDistributedStore, ReplicateConfig
 +
 +            store = MooncakeDistributedStore()
++            global_segment_size = int(
++                os.environ.get("MOONCAKE_GLOBAL_SEGMENT_SIZE", 1 << 30)
++            )
++            local_buffer_size = int(
++                os.environ.get("MOONCAKE_LOCAL_BUFFER_SIZE", 1 << 30)
++            )
++            protocol = os.environ.get("MOONCAKE_PROTOCOL", "tcp")
++            # Ascend Mooncake rejects wildcard-location segment registration.
++            # Keep setup() at zero and mount the configured host segment at the
++            # explicit CPU location instead. CUDA/ROCm retain the stock setup.
++            ascend_host = bool(
++                os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
++                or os.environ.get("ASCEND_VISIBLE_DEVICES")
++            )
++            segment_to_mount = global_segment_size if ascend_host else 0
++            if ascend_host:
++                global_segment_size = 0
++                local_buffer_size = 0
 +            rc = store.setup(
 +                local_hostname=os.environ.get("MOONCAKE_LOCAL_HOSTNAME", "localhost"),
 +                metadata_server=os.environ.get(
 +                    "MOONCAKE_METADATA_SERVER", "http://localhost:8080/metadata"
 +                ),
-+                global_segment_size=int(
-+                    os.environ.get("MOONCAKE_GLOBAL_SEGMENT_SIZE", 1 << 30)
-+                ),
-+                local_buffer_size=int(
-+                    os.environ.get("MOONCAKE_LOCAL_BUFFER_SIZE", 1 << 30)
-+                ),
-+                protocol=os.environ.get("MOONCAKE_PROTOCOL", "tcp"),
++                global_segment_size=global_segment_size,
++                local_buffer_size=local_buffer_size,
++                protocol=protocol,
 +                rdma_devices=os.environ.get("MOONCAKE_RDMA_DEVICES", ""),
 +                master_server_addr=os.environ.get(
 +                    "MOONCAKE_MASTER_SERVER_ADDR", "localhost:50051"
@@ -789,6 +803,28 @@ index 0000000..d54b920
 +            )
 +            if rc is not None and int(rc) != 0:
 +                raise RuntimeError(f"spec-capture mooncake setup failed (status {rc})")
++            if segment_to_mount:
++                mount = getattr(store, "allocate_and_mount_segment", None)
++                if not callable(mount):
++                    raise RuntimeError(
++                        "Mooncake build on this Ascend host cannot register a "
++                        "wildcard segment and has no allocate_and_mount_segment; "
++                        "upgrade mooncake-transfer-engine"
++                    )
++                result = mount(segment_to_mount, protocol, "cpu")
++                mount_rc = (
++                    result.get("ret", -1) if isinstance(result, dict) else result
++                )
++                if mount_rc is not None and int(mount_rc) != 0:
++                    raise RuntimeError(
++                        "spec-capture mooncake mount segment failed "
++                        f"(status {mount_rc})"
++                    )
++                logger.info(
++                    "spec-capture mooncake segment mounted with location=cpu "
++                    "(%d bytes)",
++                    segment_to_mount,
++                )
 +            # Hard-pin every object: SpecForge (not Mooncake's LRU) is the
 +            # lifetime authority — a committed feature must never be evicted
 +            # before the trainer consumes it.

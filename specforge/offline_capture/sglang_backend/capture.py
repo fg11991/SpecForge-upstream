@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from array import array
+import logging
 from typing import List, Optional
 
 import torch
@@ -30,6 +31,9 @@ from specforge.distributed import get_tp_group
 
 from .model_runner import SGLangRunner
 from .utils import wrap_offline_eagle3_logits_processors
+
+
+logger = logging.getLogger(__name__)
 
 
 class OfflineSGLangCaptureBackend:
@@ -105,7 +109,21 @@ class OfflineSGLangCaptureBackend:
                 "'dspark', "
                 f"got {capture_method!r}"
             )
-        setter = getattr(self.model_runner.model, setter_name, None)
+        model = self.model_runner.model
+        setter = getattr(model, setter_name, None)
+        if capture_method == "dspark" and not callable(setter):
+            fallback_name = "set_dflash_layers_to_capture"
+            fallback = getattr(model, fallback_name, None)
+            if callable(fallback):
+                logger.warning(
+                    "target model does not expose %s; falling back to %s for "
+                    "offline DSpark capture because both methods consume the "
+                    "same auxiliary and last-hidden-state artifacts",
+                    setter_name,
+                    fallback_name,
+                )
+                setter_name = fallback_name
+                setter = fallback
         if not callable(setter):
             raise RuntimeError(
                 f"target model does not expose SGLang capture hook {setter_name!r}"
@@ -132,7 +150,11 @@ class OfflineSGLangCaptureBackend:
     @torch.no_grad()
     def _forward_extend(self, reqs: list[Req]):
         cache_params = CacheInitParams(
-            disable=False,
+            # Keep the offline CLI/server-args contract intact. The backend
+            # builds a fresh tree per capture batch, so enabled radix has no
+            # cross-batch reuse, but an explicit disable flag must still reach
+            # SGLang's prefix-cache implementation.
+            disable=bool(self.model_runner.server_args.disable_radix_cache),
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
             page_size=self.model_runner.server_args.page_size,

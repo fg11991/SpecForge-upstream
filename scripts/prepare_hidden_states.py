@@ -131,6 +131,17 @@ def parse_args():
         help="Whether the input data is preformatted text with the chat template already applied to the conversation messages.",
     )
     data_group.add_argument("--num-samples", type=int, default=None)
+    data_group.add_argument(
+        "--filter-candidate-samples",
+        type=int,
+        default=None,
+        help=(
+            "Optional smoke-test bound for strategies with an algorithm loss-mask "
+            "filter. After the normal deterministic shuffle, tokenize only this "
+            "many candidates, then filter and take --num-samples. Omit for full "
+            "corpus semantics. Must be >= --num-samples when both are set."
+        ),
+    )
     data_group.add_argument("--build-dataset-num-proc", type=int, default=8)
     data_group.add_argument(
         "--minimum-valid-tokens",
@@ -257,7 +268,11 @@ def build_processed_dataset(
 ):
     """Tokenize the complete, un-sharded dataset once on rank 0."""
 
-    cache_params_string = f"{args.data_path}-{args.max_length}-{args.chat_template}-{args.target_model_path}-{args.num_samples}-{args.is_preformatted}"
+    cache_params_string = (
+        f"{args.data_path}-{args.max_length}-{args.chat_template}-"
+        f"{args.target_model_path}-{args.num_samples}-{args.is_preformatted}-"
+        f"{args.filter_candidate_samples}"
+    )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
     with rank_0_priority():
@@ -273,6 +288,9 @@ def build_processed_dataset(
             num_proc=args.build_dataset_num_proc,
             minimum_valid_tokens=args.minimum_valid_tokens,
             loss_mask_filter=loss_mask_filter,
+            candidate_samples=(
+                args.filter_candidate_samples if loss_mask_filter is not None else None
+            ),
         )
 
 
@@ -827,6 +845,21 @@ def main():
     )
     capture_plan = resolve_offline_capture_plan(args, target_model_config)
     draft_vocab_size = _resolve_draft_vocab_size(args.draft_model_config)
+    if args.filter_candidate_samples is not None:
+        if capture_plan.loss_mask_filter is None:
+            raise ValueError(
+                "--filter-candidate-samples is only valid for a strategy with "
+                "an algorithm loss-mask filter"
+            )
+        if args.num_samples is None:
+            raise ValueError(
+                "--filter-candidate-samples requires --num-samples so the "
+                "post-filter sample target is explicit"
+            )
+        if args.filter_candidate_samples < args.num_samples:
+            raise ValueError(
+                "--filter-candidate-samples must be >= --num-samples"
+            )
 
     # Initialize distributed environment (TP + DP)
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
@@ -892,6 +925,16 @@ def main():
         loss_mask_filter=capture_plan.loss_mask_filter,
     )
     if capture_plan.loss_mask_filter is not None and args.num_samples is not None:
+        if (
+            args.filter_candidate_samples is not None
+            and len(eagle3_dataset) < args.num_samples
+        ):
+            raise ValueError(
+                f"only {len(eagle3_dataset)} samples satisfy "
+                f"{capture_plan.strategy} training eligibility in the "
+                f"{args.filter_candidate_samples} shuffled candidates; "
+                f"requested --num-samples={args.num_samples}"
+            )
         eagle3_dataset = eagle3_dataset.select(
             range(min(args.num_samples, len(eagle3_dataset)))
         )

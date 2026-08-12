@@ -696,6 +696,22 @@ class DSparkVocabMappingPlanningTest(unittest.TestCase):
             self.assertFalse(_prunes_vocabulary(cfg, self.ALGORITHM))
             _validate_vocab_mapping(cfg, self.ALGORITHM, FeatureMode.STREAMING)
 
+    def test_mapping_path_preserves_unreadable_draft_config_error(self):
+        cfg = self._config(
+            "missing-draft-config",
+            vocab_mapping_path="mapping.pt",
+        )
+        with mock.patch(
+            "specforge.training.model_loading.draft_config_dict",
+            side_effect=OSError("draft config is unavailable"),
+        ):
+            with self.assertRaisesRegex(OSError, "draft config is unavailable"):
+                _validate_vocab_mapping(
+                    cfg,
+                    self.ALGORITHM,
+                    FeatureMode.STREAMING,
+                )
+
     def test_pruned_disaggregated_run_requires_a_mapping_path(self):
         cfg = self._config("configs/qwen3-8b-dspark-draftvocab32k.json")
         self.assertTrue(_prunes_vocabulary(cfg, self.ALGORITHM))

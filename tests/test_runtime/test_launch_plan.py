@@ -724,6 +724,25 @@ class LaunchPlanTest(unittest.TestCase):
         rendered = json.loads(plan.render())
         self.assertEqual(len(rendered["services"]), 3)
 
+    def test_managed_local_can_omit_lease_ttl_for_older_mooncake(self):
+        with tempfile.TemporaryDirectory() as root:
+            cfg = _managed_config(os.path.join(root, "attempt"))
+            raw = cfg.model_dump()
+            raw["deployment"]["disaggregated"]["managed_local"]["mooncake"][
+                "default_kv_lease_ttl_ms"
+            ] = None
+            cfg = Config.model_validate(raw)
+            with mock.patch(
+                "specforge.training.capture_contract.resolve_server_capture_contract",
+                return_value=CAPTURE_CONTRACT,
+            ):
+                plan = build_launch_plan(cfg, config_path="run.yaml", env={})
+
+        mooncake_argv = plan.services[0].command.argv
+        self.assertFalse(
+            any(arg.startswith("--default_kv_lease_ttl=") for arg in mooncake_argv)
+        )
+
     def test_multiserver_example_yaml_builds_the_managed_plan(self):
         path = (
             Path(__file__).resolve().parents[2]

@@ -169,7 +169,12 @@ def _validate_training_topology(
         raise ValueError("USP attention currently requires offline features")
 
 
-def _prunes_vocabulary(cfg: Config, algorithm: AlgorithmRegistration) -> bool:
+def _prunes_vocabulary(
+    cfg: Config,
+    algorithm: AlgorithmRegistration,
+    *,
+    propagate_config_error: bool = False,
+) -> bool:
     """Whether this run's draft actually predicts over a pruned vocabulary.
 
     Declaring ``supports_vocab_mapping`` says the algorithm *can* prune; only
@@ -188,6 +193,8 @@ def _prunes_vocabulary(cfg: Config, algorithm: AlgorithmRegistration) -> bool:
             cfg, provider=algorithm.providers.model.draft_config
         )
     except Exception:
+        if propagate_config_error:
+            raise
         # Resolving the draft config is not this check's job to get right. An
         # unreadable config is not evidence that the vocabulary is pruned; let
         # the model-loading boundary report the actual resolution error instead
@@ -222,7 +229,11 @@ def _validate_vocab_mapping(
         cfg.model.vocab_mapping_path
         and supports_mapping
         and not algorithm.spec.capabilities.keeps_vocab_buffers_when_unpruned
-        and not _prunes_vocabulary(cfg, algorithm)
+        and not _prunes_vocabulary(
+            cfg,
+            algorithm,
+            propagate_config_error=True,
+        )
     ):
         raise ValueError(
             f"algorithm {algorithm.name!r} run has draft_vocab_size == "

@@ -4,6 +4,12 @@
 分析对象:`specforge_sgl0514/SpecForge` — 分支 `feat/dspark-vocab-mapping`(HEAD `18fbf3f`)
 运行环境:昇腾 NPU(tige 平台 / 本地 docker),target = Qwen3.6-27B,strategy = `dspark`
 
+> **2026-08-12 / `0812_upstream` 更新：**本文命令形成于旧分支。当前分支必须
+> 配套当前 v0.5.14 capture patch，并使用 `--spec-capture-method dspark`；Ascend
+> local buffer 为 0、global segment 由主 patch 显式 mount 到 CPU。升级步骤和
+> 兼容矩阵见
+> [`2026-08-12_0812_upstream_组合风险核实与修复.md`](2026-08-12_0812_upstream_组合风险核实与修复.md)。
+
 前置文档:
 - `my_docs/2026-08-05_DSpark_VocabMapping_端到端适配总结.md` — 词表裁剪端到端
 - 仓库外:`DSPARK_NPU_PORT_PLAN_zh.md`(分支 `dspark-npu-offline`)— 当初**刻意只做 offline** 的决策记录
@@ -264,7 +270,7 @@ print(resolve_server_capture_contract(cfg, algorithm=resolve_run(cfg).algorithm)
 会打出 `method='dflash'`、`aux_layer_ids=(...)`、`target_hidden_size`、`target_vocab_size`、`draft_vocab_size`。填进下面:
 
 ```bash
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 GDN_ATTN_BACKEND_TRITON=1 python -m sglang.launch_server --model-path /dpc/hot/model/y00830025/Qwen3___6-27B --dtype bfloat16 --trust-remote-code --skip-tokenizer-init --tp-size 4 --chunked-prefill-size -1 --disable-radix-cache --enable-spec-capture --spec-capture-method dflash --spec-capture-aux-layer-ids <填ids> --attention-backend ascend --context-length 4103 --mem-fraction-static 0.8 --host 127.0.0.1 --port 30000
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 GDN_ATTN_BACKEND_TRITON=1 MOONCAKE_LOCAL_BUFFER_SIZE=0 python -m sglang.launch_server --model-path /dpc/hot/model/y00830025/Qwen3___6-27B --dtype bfloat16 --trust-remote-code --skip-tokenizer-init --tp-size 4 --chunked-prefill-size -1 --disable-radix-cache --enable-spec-capture --spec-capture-method dspark --spec-capture-aux-layer-ids <填ids> --attention-backend ascend --context-length 4103 --mem-fraction-static 0.8 --host 127.0.0.1 --port 30000
 ```
 
 不能改的几项:

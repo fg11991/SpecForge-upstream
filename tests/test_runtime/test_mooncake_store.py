@@ -10,6 +10,8 @@ end-to-end test against ``mooncake`` is gated below on the package import.
 
 import ctypes
 import importlib.util
+import sys
+import types
 import unittest
 from unittest import mock
 
@@ -110,6 +112,53 @@ def _store(**kw):
 
 
 class TestMooncakeFeatureStore(unittest.TestCase):
+    def test_ascend_zeroes_only_the_client_local_buffer_with_warning(self):
+        import specforge.runtime.data_plane.mooncake_store as mooncake_store
+
+        fake = _FakeMooncakeStore()
+
+        class _ReplicateConfig:
+            def __init__(self):
+                self.replica_num = 1
+                self.with_hard_pin = False
+
+        mooncake_store_module = types.ModuleType("mooncake.store")
+        mooncake_store_module.MooncakeDistributedStore = mock.Mock(return_value=fake)
+        mooncake_store_module.ReplicateConfig = _ReplicateConfig
+        mooncake_package = types.ModuleType("mooncake")
+        mooncake_package.store = mooncake_store_module
+        fake.setup = mock.Mock(return_value=0)
+
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {
+                    "mooncake": mooncake_package,
+                    "mooncake.store": mooncake_store_module,
+                },
+            ),
+            mock.patch.object(mooncake_store, "_bind_transport_device"),
+            mock.patch.object(
+                mooncake_store,
+                "_ascend_runtime_available",
+                return_value=True,
+            ),
+            self.assertLogs(mooncake_store.logger, level="WARNING") as logs,
+        ):
+            connected, _ = mooncake_store._connect_store(
+                {
+                    "global_segment_size": 16 << 30,
+                    "local_buffer_size": 1 << 30,
+                    "protocol": "tcp",
+                }
+            )
+
+        self.assertIs(connected, fake)
+        kwargs = fake.setup.call_args.kwargs
+        self.assertEqual(kwargs["global_segment_size"], 16 << 30)
+        self.assertEqual(kwargs["local_buffer_size"], 0)
+        self.assertIn("ignores configured local_buffer_size", "\n".join(logs.output))
+
     def test_put_get_roundtrip_bit_exact(self):
         fs = _store()
         src = _tensors()
