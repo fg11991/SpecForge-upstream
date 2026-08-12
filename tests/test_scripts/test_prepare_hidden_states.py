@@ -1,6 +1,7 @@
 import contextlib
 import gzip
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,7 +13,9 @@ import torch
 from scripts.prepare_hidden_states import (
     HiddenStatesGenerator,
     _generate_shared_vocab_mapping,
+    _prepare_shared_vocab_mapping,
     _resolve_draft_vocab_size,
+    _reuse_shared_vocab_mapping,
     _validate_bounded_vocab_mapping,
     build_processed_dataset,
     build_target_model,
@@ -210,6 +213,14 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
             candidate_samples=256,
             draft_vocab_size=151_936,
             target_vocab_size=151_936,
+        )
+
+    def test_bounded_smoke_allows_pruned_vocab_with_existing_mapping(self):
+        _validate_bounded_vocab_mapping(
+            candidate_samples=256,
+            draft_vocab_size=32_000,
+            target_vocab_size=151_936,
+            vocab_mapping_path="mapping.pt",
         )
 
     def test_strategy_capture_plans_use_draft_owned_layers_and_schemas(self):
@@ -493,6 +504,78 @@ class PrepareHiddenStatesVocabMappingTest(unittest.TestCase):
             self.assertTrue(expected.is_file())
             generate_mock.assert_called_once()
             broadcast.assert_called_once()
+
+    def test_reuses_mapping_after_shape_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mapping_path = Path(directory) / "mapping.pt"
+            torch.save(
+                {
+                    "d2t": torch.zeros(4, dtype=torch.long),
+                    "t2d": torch.zeros(8, dtype=torch.bool),
+                },
+                mapping_path,
+            )
+            with (
+                mock.patch(
+                    "scripts.prepare_hidden_states.dist.get_rank", return_value=0
+                ),
+                mock.patch(
+                    "scripts.prepare_hidden_states.dist.broadcast_object_list"
+                ),
+            ):
+                actual = _reuse_shared_vocab_mapping(
+                    str(mapping_path),
+                    target_vocab_size=8,
+                    draft_vocab_size=4,
+                )
+
+        self.assertEqual(actual, os.path.abspath(str(mapping_path)))
+
+    def test_rejects_existing_mapping_with_wrong_shape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mapping_path = Path(directory) / "mapping.pt"
+            torch.save(
+                {
+                    "d2t": torch.zeros(3, dtype=torch.long),
+                    "t2d": torch.zeros(8, dtype=torch.bool),
+                },
+                mapping_path,
+            )
+            with (
+                mock.patch(
+                    "scripts.prepare_hidden_states.dist.get_rank", return_value=0
+                ),
+                mock.patch(
+                    "scripts.prepare_hidden_states.dist.broadcast_object_list"
+                ),
+                self.assertRaisesRegex(RuntimeError, "expected \\(4,\\)"),
+            ):
+                _reuse_shared_vocab_mapping(
+                    str(mapping_path),
+                    target_vocab_size=8,
+                    draft_vocab_size=4,
+                )
+
+    @mock.patch("scripts.prepare_hidden_states._generate_shared_vocab_mapping")
+    @mock.patch("scripts.prepare_hidden_states._reuse_shared_vocab_mapping")
+    def test_existing_mapping_path_skips_generation(self, reuse, generate):
+        reuse.return_value = "/resolved/mapping.pt"
+
+        actual = _prepare_shared_vocab_mapping(
+            object(),
+            output_path="/unused/output",
+            existing_mapping_path="/existing/mapping.pt",
+            target_vocab_size=8,
+            draft_vocab_size=4,
+        )
+
+        self.assertEqual(actual, "/resolved/mapping.pt")
+        reuse.assert_called_once_with(
+            "/existing/mapping.pt",
+            target_vocab_size=8,
+            draft_vocab_size=4,
+        )
+        generate.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import sys
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -38,6 +39,9 @@ class ScanReport:
     invalid_after_truncation: int
     truncation_induced_invalid: int
     invalid_at_full_length: int
+    unreadable_files: int
+    streaming_fallback_files: int
+    streaming_fallback_reasons: dict[str, int]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -58,7 +62,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--invalid-paths-output",
         type=Path,
-        help="Optional newline-delimited list of incompatible feature files.",
+        help=(
+            "Optional newline-delimited list of incompatible or unreadable "
+            "feature files."
+        ),
     )
     parser.add_argument(
         "--json",
@@ -68,14 +75,32 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _scan_one(args: tuple[str, int]) -> tuple[str, bool, bool]:
+def _scan_one(
+    args: tuple[str, int],
+) -> tuple[str, bool | None, bool | None, str | None, str | None]:
     path, max_length = args
-    raw = read_feature_keys_streaming(path, ("loss_mask",))
-    loss_mask = raw["loss_mask"].reshape(-1)
+    fallback_reasons: list[str] = []
+    try:
+        raw = read_feature_keys_streaming(
+            path,
+            ("loss_mask",),
+            fallback_observer=fallback_reasons.append,
+        )
+        loss_mask = raw["loss_mask"].reshape(-1)
+    except Exception as exc:
+        return (
+            path,
+            None,
+            None,
+            f"{type(exc).__name__}: {exc}",
+            fallback_reasons[0] if fallback_reasons else None,
+        )
     return (
         path,
         has_consecutive_supervised_tokens(loss_mask),
         has_consecutive_supervised_tokens(loss_mask[:max_length]),
+        None,
+        fallback_reasons[0] if fallback_reasons else None,
     )
 
 
@@ -84,7 +109,7 @@ def _scan_results(
     *,
     max_length: int,
     num_workers: int,
-) -> Iterator[tuple[str, bool, bool]]:
+) -> Iterator[tuple[str, bool | None, bool | None, str | None, str | None]]:
     work = ((path, max_length) for path in paths)
     if num_workers == 1:
         yield from map(_scan_one, work)
@@ -116,13 +141,26 @@ def scan_feature_directory(
     compatible = 0
     truncation_induced = 0
     invalid_full = 0
+    unreadable = 0
+    fallback_reasons: Counter[str] = Counter()
     invalid_paths: list[str] = []
     progress_interval = max(1, min(10_000, len(paths) // 100 or 1))
-    for scanned, (path, valid_full, valid_truncated) in enumerate(
+    for scanned, (
+        path,
+        valid_full,
+        valid_truncated,
+        read_error,
+        fallback_reason,
+    ) in enumerate(
         _scan_results(paths, max_length=max_length, num_workers=num_workers),
         start=1,
     ):
-        if valid_truncated:
+        if fallback_reason is not None:
+            fallback_reasons[fallback_reason] += 1
+        if read_error is not None:
+            unreadable += 1
+            invalid_paths.append(path)
+        elif valid_truncated:
             compatible += 1
         else:
             invalid_paths.append(path)
@@ -135,7 +173,8 @@ def scan_feature_directory(
         ):
             print(
                 f"scanned {scanned}/{len(paths)} feature files "
-                f"({len(invalid_paths)} invalid)",
+                f"({len(invalid_paths) - unreadable} invalid, "
+                f"{unreadable} unreadable)",
                 file=sys.stderr,
                 flush=True,
             )
@@ -145,9 +184,12 @@ def scan_feature_directory(
         max_length=max_length,
         total_files=len(paths),
         compatible_after_truncation=compatible,
-        invalid_after_truncation=len(invalid_paths),
+        invalid_after_truncation=len(invalid_paths) - unreadable,
         truncation_induced_invalid=truncation_induced,
         invalid_at_full_length=invalid_full,
+        unreadable_files=unreadable,
+        streaming_fallback_files=sum(fallback_reasons.values()),
+        streaming_fallback_reasons=dict(sorted(fallback_reasons.items())),
     )
     return report, invalid_paths
 
@@ -173,6 +215,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.invalid_paths_output is not None:
         _write_invalid_paths(args.invalid_paths_output, invalid_paths)
 
+    if report.streaming_fallback_files:
+        reasons = ", ".join(
+            f"{reason}={count}"
+            for reason, count in report.streaming_fallback_reasons.items()
+        )
+        print(
+            "streaming fallback summary: "
+            f"files={report.streaming_fallback_files}; {reasons}",
+            file=sys.stderr,
+        )
+
     payload = asdict(report)
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
@@ -184,7 +237,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"invalid after truncation: {report.invalid_after_truncation}")
         print(f"  caused by truncation: {report.truncation_induced_invalid}")
         print(f"  invalid at full length: {report.invalid_at_full_length}")
-    return 1 if report.invalid_after_truncation else 0
+        print(f"unreadable files: {report.unreadable_files}")
+    return 1 if report.invalid_after_truncation or report.unreadable_files else 0
 
 
 if __name__ == "__main__":

@@ -9,6 +9,8 @@ from unittest import mock
 import torch
 
 from specforge.runtime.data_plane.feature_store import (
+    _STREAMING_FALLBACK_COUNTS,
+    _STREAMING_FALLBACK_WARNED,
     load_feature_file,
     read_feature_keys_streaming,
 )
@@ -53,6 +55,10 @@ def _write_feature(path: Path, *, prefix_large_tensor: bool = False) -> dict:
 
 
 class FeatureStreamingReaderTest(unittest.TestCase):
+    def setUp(self):
+        _STREAMING_FALLBACK_COUNTS.clear()
+        _STREAMING_FALLBACK_WARNED.clear()
+
     def test_gzip_reader_stops_after_loss_mask_storage(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "feature.ckpt.gz"
@@ -124,6 +130,37 @@ class FeatureStreamingReaderTest(unittest.TestCase):
 
         fallback.assert_called_once_with(str(path))
         self.assertTrue(torch.equal(actual["loss_mask"], expected["loss_mask"]))
+
+    def test_same_fallback_reason_warns_once_and_observes_every_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [Path(directory) / f"legacy-{index}.ckpt.gz" for index in range(2)]
+            expected = {"loss_mask": torch.tensor([0, 1, 1, 0])}
+            for path in paths:
+                with gzip.open(path, "wb") as stream:
+                    torch.save(
+                        expected,
+                        stream,
+                        _use_new_zipfile_serialization=False,
+                    )
+            observed = []
+
+            with mock.patch(
+                "specforge.runtime.data_plane.feature_store.logger.warning"
+            ) as warning:
+                for path in paths:
+                    actual = read_feature_keys_streaming(
+                        str(path),
+                        ("loss_mask",),
+                        fallback_observer=observed.append,
+                    )
+                    self.assertTrue(
+                        torch.equal(actual["loss_mask"], expected["loss_mask"])
+                    )
+
+        self.assertEqual(len(observed), 2)
+        self.assertEqual(observed[0], observed[1])
+        warning.assert_called_once()
+        self.assertEqual(_STREAMING_FALLBACK_COUNTS[observed[0]], 2)
 
 
 if __name__ == "__main__":

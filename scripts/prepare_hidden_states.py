@@ -117,6 +117,16 @@ def parse_args():
         ),
     )
     model_group.add_argument(
+        "--vocab-mapping-path",
+        type=str,
+        default=None,
+        help=(
+            "Reuse an existing vocab_mapping.pt after validating its t2d/d2t "
+            "shapes. This skips mapping generation and permits bounded smoke "
+            "candidates for a pruned draft vocabulary."
+        ),
+    )
+    model_group.add_argument(
         "--trust-remote-code",
         action="store_true",
         help="Trust remote code when loading models",
@@ -371,14 +381,90 @@ def _validate_bounded_vocab_mapping(
     candidate_samples: Optional[int],
     draft_vocab_size: int,
     target_vocab_size: int,
+    vocab_mapping_path: Optional[str] = None,
 ) -> None:
-    if candidate_samples is not None and draft_vocab_size < target_vocab_size:
+    if (
+        candidate_samples is not None
+        and draft_vocab_size < target_vocab_size
+        and vocab_mapping_path is None
+    ):
         raise ValueError(
             "--filter-candidate-samples cannot generate a pruned vocabulary "
             "mapping: a bounded smoke candidate set produces unstable t2d/d2t "
-            "that could be mistaken for the full-corpus mapping. Omit the flag "
-            "when draft_vocab_size < target vocab_size."
+            "that could be mistaken for the full-corpus mapping. Omit the flag, "
+            "or pass --vocab-mapping-path to reuse a validated full-corpus "
+            "mapping."
         )
+
+
+def _reuse_shared_vocab_mapping(
+    mapping_path: str,
+    *,
+    target_vocab_size: int,
+    draft_vocab_size: int,
+) -> str:
+    """Validate an existing mapping on rank zero and share its resolved path."""
+
+    result = [None]
+    if dist.get_rank() == 0:
+        try:
+            resolved_path = os.path.abspath(os.path.expanduser(mapping_path))
+            mapping = torch.load(
+                resolved_path,
+                map_location="cpu",
+                weights_only=True,
+            )
+            if not isinstance(mapping, Mapping):
+                raise ValueError("mapping payload must be a mapping")
+            d2t = mapping.get("d2t")
+            t2d = mapping.get("t2d")
+            if not isinstance(d2t, torch.Tensor) or tuple(d2t.shape) != (
+                draft_vocab_size,
+            ):
+                raise ValueError(
+                    f"invalid d2t shape; expected ({draft_vocab_size},), "
+                    f"got {getattr(d2t, 'shape', None)}"
+                )
+            if not isinstance(t2d, torch.Tensor) or tuple(t2d.shape) != (
+                target_vocab_size,
+            ):
+                raise ValueError(
+                    f"invalid t2d shape; expected ({target_vocab_size},), "
+                    f"got {getattr(t2d, 'shape', None)}"
+                )
+            result[0] = {"path": resolved_path}
+        except BaseException as exc:
+            result[0] = {"error": f"{type(exc).__name__}: {exc}"}
+
+    dist.broadcast_object_list(result, src=0)
+    if result[0] is None or "error" in result[0]:
+        reason = "rank 0 did not publish a result"
+        if result[0] is not None:
+            reason = result[0]["error"]
+        raise RuntimeError(f"failed to reuse vocabulary mapping: {reason}")
+    return result[0]["path"]
+
+
+def _prepare_shared_vocab_mapping(
+    dataset,
+    *,
+    output_path: str,
+    existing_mapping_path: Optional[str],
+    target_vocab_size: int,
+    draft_vocab_size: int,
+) -> str:
+    if existing_mapping_path is not None:
+        return _reuse_shared_vocab_mapping(
+            existing_mapping_path,
+            target_vocab_size=target_vocab_size,
+            draft_vocab_size=draft_vocab_size,
+        )
+    return _generate_shared_vocab_mapping(
+        dataset,
+        output_path=output_path,
+        target_vocab_size=target_vocab_size,
+        draft_vocab_size=draft_vocab_size,
+    )
 
 
 def _sglang_kwargs(args: argparse.Namespace) -> Dict[str, object]:
@@ -906,6 +992,7 @@ def main():
         candidate_samples=args.filter_candidate_samples,
         draft_vocab_size=draft_vocab_size,
         target_vocab_size=target_vocab_size,
+        vocab_mapping_path=args.vocab_mapping_path,
     )
 
     print_with_rank(
@@ -962,9 +1049,10 @@ def main():
         )
     print_with_rank(f"Dataset prepared with {len(eagle3_dataset)} samples.")
 
-    vocab_mapping_path = _generate_shared_vocab_mapping(
+    vocab_mapping_path = _prepare_shared_vocab_mapping(
         eagle3_dataset,
         output_path=args.output_path,
+        existing_mapping_path=args.vocab_mapping_path,
         target_vocab_size=target_vocab_size,
         draft_vocab_size=draft_vocab_size,
     )

@@ -57,7 +57,7 @@ import sys
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, urlparse
@@ -72,6 +72,10 @@ from specforge.runtime.contracts import (
 )
 
 logger = logging.getLogger(__name__)
+
+_STREAMING_FALLBACK_COUNTS: Counter[str] = Counter()
+_STREAMING_FALLBACK_WARNED: set[str] = set()
+_STREAMING_FALLBACK_LOCK = threading.Lock()
 
 _DTYPE_BYTES = {  # best-effort; falls back to element_size() for real tensors
     "float32": 4,
@@ -523,6 +527,7 @@ def read_feature_keys_streaming(
     path: str,
     keys: Tuple[str, ...],
     *,
+    fallback_observer: Optional[Callable[[str], None]] = None,
     _gzip_open: Callable[..., Any] = gzip.open,
     _fallback_loader: Callable[[str], Dict[str, torch.Tensor]] = load_feature_file,
 ) -> Dict[str, torch.Tensor]:
@@ -544,11 +549,21 @@ def read_feature_keys_streaming(
         with _gzip_open(path, "rb") as stream:
             return _read_torch_save_keys_from_stream(stream, requested)
     except Exception as exc:
-        logger.warning(
-            "streaming feature read fell back to full load for %s: %s",
-            path,
-            exc,
-        )
+        reason = type(exc).__name__
+        with _STREAMING_FALLBACK_LOCK:
+            _STREAMING_FALLBACK_COUNTS[reason] += 1
+            should_warn = reason not in _STREAMING_FALLBACK_WARNED
+            _STREAMING_FALLBACK_WARNED.add(reason)
+        if should_warn:
+            logger.warning(
+                "streaming feature read fell back to full load for %s due to "
+                "%s (further %s fallbacks are suppressed in this process)",
+                path,
+                exc,
+                reason,
+            )
+        if fallback_observer is not None:
+            fallback_observer(reason)
         raw = _fallback_loader(path)
         return {key: raw[key] for key in requested}
 

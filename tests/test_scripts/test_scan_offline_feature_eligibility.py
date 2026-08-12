@@ -27,6 +27,30 @@ def _write_feature(path: Path, loss_mask) -> None:
 
 
 class TestScanOfflineFeatureEligibility(unittest.TestCase):
+    def test_unreadable_gzip_does_not_abort_parallel_scan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_feature(root / "valid.ckpt.gz", [0, 1, 1, 0])
+            truncated = root / "truncated.ckpt.gz"
+            _write_feature(truncated, [0, 1, 1, 0])
+            compressed = truncated.read_bytes()
+            truncated.write_bytes(compressed[: max(16, len(compressed) // 20)])
+
+            report, invalid_paths = scan_feature_directory(
+                root, max_length=4, num_workers=2
+            )
+
+            self.assertEqual(report.total_files, 2)
+            self.assertEqual(report.compatible_after_truncation, 1)
+            self.assertEqual(report.invalid_after_truncation, 0)
+            self.assertEqual(report.unreadable_files, 1)
+            self.assertEqual(report.streaming_fallback_files, 1)
+            self.assertEqual(sum(report.streaming_fallback_reasons.values()), 1)
+            self.assertEqual(
+                [Path(path).name for path in invalid_paths],
+                ["truncated.ckpt.gz"],
+            )
+
     def test_distinguishes_truncation_from_already_invalid_samples(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -52,6 +76,10 @@ class TestScanOfflineFeatureEligibility(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             _write_feature(root / "invalid.ckpt", [1, 0, 1])
+            truncated = root / "truncated.ckpt.gz"
+            _write_feature(truncated, [0, 1, 1, 0])
+            compressed = truncated.read_bytes()
+            truncated.write_bytes(compressed[: max(16, len(compressed) // 20)])
             invalid_output = root / "invalid.txt"
             script = (
                 Path(__file__).parents[2]
@@ -86,7 +114,15 @@ class TestScanOfflineFeatureEligibility(unittest.TestCase):
             self.assertEqual(
                 json.loads(completed.stdout)["invalid_after_truncation"], 1
             )
-            self.assertIn("invalid.ckpt", invalid_output.read_text(encoding="utf-8"))
+            self.assertEqual(json.loads(completed.stdout)["unreadable_files"], 1)
+            self.assertIn(
+                "streaming fallback summary: files=1", completed.stderr
+            )
+            invalid_names = {
+                Path(path).name
+                for path in invalid_output.read_text(encoding="utf-8").splitlines()
+            }
+            self.assertEqual(invalid_names, {"invalid.ckpt", "truncated.ckpt.gz"})
 
 
 if __name__ == "__main__":
