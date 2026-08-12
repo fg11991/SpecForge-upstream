@@ -1,6 +1,7 @@
 # coding=utf-8
 """Offline EAGLE vocab mapping is derivable from canonical feature files."""
 
+import gzip
 import tempfile
 import unittest
 from collections import Counter
@@ -13,6 +14,7 @@ from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.config import Config
 from specforge.data.vocab_mapping import count_effective_feature_tokens
 from specforge.modeling.draft.vocab_mixin import DraftVocabMappingMixin
+from specforge.runtime.data_plane.feature_store import read_feature_keys_streaming
 from specforge.training.assembly import (
     _ensure_offline_vocab_mapping,
     _install_dataset_vocab_mapping,
@@ -113,6 +115,75 @@ class OfflineVocabMappingTest(unittest.TestCase):
             )
 
         self.assertEqual(counts, {2: 3, 4: 1})
+
+    def test_gzipped_features_are_counted_without_full_decompression(self):
+        """The counter needs input_ids/loss_mask only, and both precede the
+        hidden states, so a .ckpt.gz corpus must not be inflated in full."""
+
+        inflated = []
+
+        class _CountingGzip:
+            def __init__(self, *args, **kwargs):
+                self._stream = gzip.open(*args, **kwargs)
+
+            def __enter__(self):
+                self._stream.__enter__()
+                return self
+
+            def __exit__(self, *exc_info):
+                return self._stream.__exit__(*exc_info)
+
+            def read(self, size=-1):
+                chunk = self._stream.read(size)
+                inflated.append(len(chunk))
+                return chunk
+
+        def _counting_reader(path, keys):
+            return read_feature_keys_streaming(path, keys, _gzip_open=_CountingGzip)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plain = root / "plain"
+            compressed = root / "compressed"
+            plain.mkdir()
+            compressed.mkdir()
+            uncompressed_bytes = 0
+            for index in range(3):
+                record = {
+                    "input_ids": torch.arange(index, index + 64, dtype=torch.long) % 8,
+                    "loss_mask": torch.ones(64, dtype=torch.long),
+                    # Large enough that inflating it would dominate the read;
+                    # production samples are two orders larger still.
+                    "hidden_states": torch.zeros(64, 16384, dtype=torch.bfloat16),
+                }
+                uncompressed_bytes += sum(
+                    tensor.numel() * tensor.element_size() for tensor in record.values()
+                )
+                torch.save(record, plain / f"{index:03d}.ckpt")
+                with gzip.open(compressed / f"{index:03d}.ckpt.gz", "wb") as handle:
+                    torch.save(record, handle)
+
+            expected = count_effective_feature_tokens(str(plain), target_vocab_size=8)
+            actual = count_effective_feature_tokens(
+                str(compressed),
+                target_vocab_size=8,
+                _read_features=_counting_reader,
+            )
+
+        self.assertEqual(actual, expected)
+        self.assertTrue(inflated, "streaming reader was never exercised")
+        # Bounded below by the reader's 64 KiB chunk per streamed member, not
+        # by sample size: the hidden states are never inflated.
+        self.assertLess(sum(inflated), uncompressed_bytes // 10)
+
+    def test_missing_features_name_the_offending_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            torch.save(
+                {"input_ids": torch.tensor([1, 2])},
+                Path(directory) / "incomplete.ckpt",
+            )
+            with self.assertRaisesRegex(KeyError, "cannot derive an EAGLE vocab"):
+                count_effective_feature_tokens(directory)
 
     def test_rejects_out_of_range_token_ids(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -46,6 +46,7 @@ import gzip
 import hashlib
 import json
 import os
+import shutil
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -123,7 +124,9 @@ def parse_args():
         help=(
             "Reuse an existing vocab_mapping.pt after validating its t2d/d2t "
             "shapes. This skips mapping generation and permits bounded smoke "
-            "candidates for a pruned draft vocabulary."
+            "candidates for a pruned draft vocabulary. The validated file is "
+            "copied to <output-path>/vocab_mapping/vocab_mapping.pt so training "
+            "on these features does not derive a mapping of its own."
         ),
     )
     model_group.add_argument(
@@ -400,13 +403,25 @@ def _validate_bounded_vocab_mapping(
 def _reuse_shared_vocab_mapping(
     mapping_path: str,
     *,
+    output_path: str,
     target_vocab_size: int,
     draft_vocab_size: int,
 ) -> str:
-    """Validate an existing mapping on rank zero and share its resolved path."""
+    """Validate an existing mapping on rank zero and publish it with the run.
 
+    The validated file is copied under ``output_path`` so a reused mapping ends
+    up exactly where a generated one would. Without that copy the feature
+    directory carries no mapping, and a training run that does not set
+    ``model.vocab_mapping_path`` derives a fresh one from these features --
+    which for a bounded smoke capture is the unstable mapping this flag exists
+    to avoid.
+    """
+
+    mapping_dir = os.path.join(output_path, "vocab_mapping")
+    published_path = os.path.join(mapping_dir, "vocab_mapping.pt")
     result = [None]
     if dist.get_rank() == 0:
+        temporary_path = None
         try:
             resolved_path = os.path.abspath(os.path.expanduser(mapping_path))
             mapping = torch.load(
@@ -432,9 +447,29 @@ def _reuse_shared_vocab_mapping(
                     f"invalid t2d shape; expected ({target_vocab_size},), "
                     f"got {getattr(t2d, 'shape', None)}"
                 )
-            result[0] = {"path": resolved_path}
+            os.makedirs(mapping_dir, exist_ok=True)
+            already_published = os.path.exists(published_path) and os.path.samefile(
+                resolved_path, published_path
+            )
+            if not already_published:
+                # Copy the bytes rather than re-serializing the two validated
+                # tensors: the published file then matches the source exactly,
+                # including any extra keys a future mapping format adds.
+                temporary_path = os.path.join(
+                    mapping_dir, f".vocab_mapping.{uuid.uuid4().hex}.tmp"
+                )
+                shutil.copyfile(resolved_path, temporary_path)
+                os.replace(temporary_path, published_path)
+                temporary_path = None
+            result[0] = {"path": published_path}
         except BaseException as exc:
             result[0] = {"error": f"{type(exc).__name__}: {exc}"}
+        finally:
+            if temporary_path is not None:
+                try:
+                    os.remove(temporary_path)
+                except OSError:
+                    pass
 
     dist.broadcast_object_list(result, src=0)
     if result[0] is None or "error" in result[0]:
@@ -442,7 +477,12 @@ def _reuse_shared_vocab_mapping(
         if result[0] is not None:
             reason = result[0]["error"]
         raise RuntimeError(f"failed to reuse vocabulary mapping: {reason}")
-    return result[0]["path"]
+    if result[0]["path"] != published_path:
+        raise RuntimeError(
+            "vocabulary mapping reuse returned an unexpected path: "
+            f"{result[0]['path']} != {published_path}"
+        )
+    return published_path
 
 
 def _prepare_shared_vocab_mapping(
@@ -456,6 +496,7 @@ def _prepare_shared_vocab_mapping(
     if existing_mapping_path is not None:
         return _reuse_shared_vocab_mapping(
             existing_mapping_path,
+            output_path=output_path,
             target_vocab_size=target_vocab_size,
             draft_vocab_size=draft_vocab_size,
         )

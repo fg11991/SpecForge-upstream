@@ -15,8 +15,17 @@ allowed to reach into specforge.training.
 
 from __future__ import annotations
 
+import logging
 from collections import Counter
-from typing import Optional
+from typing import Any, Callable, Dict, Optional
+
+logger = logging.getLogger(__name__)
+
+_REQUIRED_FEATURES = ("input_ids", "loss_mask")
+#: Log a heartbeat roughly this many times, and only for corpora large enough
+#: that a silent pass would read as a hang.
+_PROGRESS_STEPS = 20
+_PROGRESS_MIN_FILES = 500
 
 
 def count_effective_feature_tokens(
@@ -24,27 +33,53 @@ def count_effective_feature_tokens(
     *,
     max_length: Optional[int] = None,
     target_vocab_size: Optional[int] = None,
+    _read_features: Optional[Callable[[str, tuple], Dict[str, Any]]] = None,
 ) -> Counter:
     """Count loss-bearing tokens directly from prepared offline features.
 
     Offline feature files already contain the exact ``input_ids`` and
     ``loss_mask`` used for training. Reading those tensors avoids requiring the
     original raw conversation dataset solely to rebuild a vocabulary map.
+
+    Only ``input_ids`` and ``loss_mask`` are read. Both are written ahead of the
+    hidden states, so the streaming reader stops early instead of materializing
+    every sample -- for ``.ckpt.gz`` features that is the difference between
+    decompressing the whole corpus and decompressing a few kilobytes per file.
     """
-    from specforge.runtime.data_plane.feature_store import load_feature_file
+    from specforge.runtime.data_plane.feature_store import read_feature_keys_streaming
     from specforge.runtime.data_plane.offline_reader import list_feature_files
 
+    read_features = _read_features or read_feature_keys_streaming
     paths = list_feature_files(hidden_states_path)
     if not paths:
         raise ValueError(f"no offline feature files found under {hidden_states_path!r}")
 
+    progress_interval = 0
+    if len(paths) >= _PROGRESS_MIN_FILES:
+        progress_interval = max(1, len(paths) // _PROGRESS_STEPS)
+        logger.info(
+            "deriving vocabulary token counts from %d offline feature files "
+            "under %s",
+            len(paths),
+            hidden_states_path,
+        )
+
     counts: Counter = Counter()
-    for path in paths:
-        raw = load_feature_file(path)
-        missing = [name for name in ("input_ids", "loss_mask") if name not in raw]
-        if missing:
+    for scanned, path in enumerate(paths, start=1):
+        try:
+            raw = read_features(path, _REQUIRED_FEATURES)
+        except KeyError as exc:
             raise KeyError(
-                f"{path} cannot derive an EAGLE vocab mapping; missing {missing}"
+                f"{path} cannot derive an EAGLE vocab mapping; missing "
+                f"{list(exc.args[:1])}"
+            ) from exc
+        if progress_interval and (
+            scanned % progress_interval == 0 or scanned == len(paths)
+        ):
+            logger.info(
+                "vocabulary token counts: read %d/%d feature files",
+                scanned,
+                len(paths),
             )
         input_ids = raw["input_ids"].reshape(-1)
         loss_mask = raw["loss_mask"].reshape(-1)

@@ -507,7 +507,10 @@ class PrepareHiddenStatesVocabMappingTest(unittest.TestCase):
 
     def test_reuses_mapping_after_shape_validation(self):
         with tempfile.TemporaryDirectory() as directory:
-            mapping_path = Path(directory) / "mapping.pt"
+            source_dir = Path(directory) / "source"
+            source_dir.mkdir()
+            output_dir = Path(directory) / "features"
+            mapping_path = source_dir / "mapping.pt"
             torch.save(
                 {
                     "d2t": torch.zeros(4, dtype=torch.long),
@@ -523,11 +526,50 @@ class PrepareHiddenStatesVocabMappingTest(unittest.TestCase):
             ):
                 actual = _reuse_shared_vocab_mapping(
                     str(mapping_path),
+                    output_path=str(output_dir),
                     target_vocab_size=8,
                     draft_vocab_size=4,
                 )
 
-        self.assertEqual(actual, os.path.abspath(str(mapping_path)))
+            published = output_dir / "vocab_mapping" / "vocab_mapping.pt"
+            # A reused mapping must land where a generated one would, or a
+            # later training run derives its own from these features.
+            self.assertEqual(actual, str(published))
+            self.assertTrue(published.is_file())
+            self.assertEqual(published.read_bytes(), mapping_path.read_bytes())
+            self.assertEqual(
+                sorted(p.name for p in published.parent.iterdir()),
+                ["vocab_mapping.pt"],
+            )
+
+    def test_reusing_the_already_published_mapping_is_a_no_op(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "features"
+            published = output_dir / "vocab_mapping" / "vocab_mapping.pt"
+            published.parent.mkdir(parents=True)
+            torch.save(
+                {
+                    "d2t": torch.zeros(4, dtype=torch.long),
+                    "t2d": torch.zeros(8, dtype=torch.bool),
+                },
+                published,
+            )
+            original = published.read_bytes()
+            with (
+                mock.patch(
+                    "scripts.prepare_hidden_states.dist.get_rank", return_value=0
+                ),
+                mock.patch("scripts.prepare_hidden_states.dist.broadcast_object_list"),
+            ):
+                actual = _reuse_shared_vocab_mapping(
+                    str(published),
+                    output_path=str(output_dir),
+                    target_vocab_size=8,
+                    draft_vocab_size=4,
+                )
+
+            self.assertEqual(actual, str(published))
+            self.assertEqual(published.read_bytes(), original)
 
     def test_rejects_existing_mapping_with_wrong_shape(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -548,6 +590,7 @@ class PrepareHiddenStatesVocabMappingTest(unittest.TestCase):
             ):
                 _reuse_shared_vocab_mapping(
                     str(mapping_path),
+                    output_path=directory,
                     target_vocab_size=8,
                     draft_vocab_size=4,
                 )
@@ -568,6 +611,7 @@ class PrepareHiddenStatesVocabMappingTest(unittest.TestCase):
         self.assertEqual(actual, "/resolved/mapping.pt")
         reuse.assert_called_once_with(
             "/existing/mapping.pt",
+            output_path="/unused/output",
             target_vocab_size=8,
             draft_vocab_size=4,
         )
