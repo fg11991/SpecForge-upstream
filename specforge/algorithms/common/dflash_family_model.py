@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from specforge.core.chunking import checkpointed_chunk_reduce
 from specforge.modeling.draft.dflash import DFlashDraftModel
+from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
 from specforge.modeling.draft.vocab_mixin import OUT_OF_DRAFT_VOCAB_LABEL
 
 try:
@@ -49,7 +50,18 @@ def compute_accept_len(
     return accept_prefix.sum(dim=2).float()
 
 
-def create_dflash_sdpa_mask(anchor_positions, block_keep_mask, S, block_size, device):
+def create_dflash_sdpa_mask(
+    anchor_positions,
+    block_keep_mask,
+    S,
+    block_size,
+    device,
+    sliding_window: Optional[int] = None,
+):
+    """Construct a full or sliding dense boolean DFlash mask."""
+
+    if sliding_window is not None and sliding_window <= 0:
+        raise ValueError("sliding_window must be > 0")
     B, N = anchor_positions.shape
     Q_LEN = N * block_size
     KV_LEN = S + N * block_size
@@ -60,16 +72,24 @@ def create_dflash_sdpa_mask(anchor_positions, block_keep_mask, S, block_size, de
     )  # (1, 1, 1, KV_LEN)
 
     q_block_ids = q_indices // block_size
+    q_block_offsets = q_indices % block_size
 
     anchor_expanded = anchor_positions.view(B, 1, N, 1).repeat_interleave(
         block_size, dim=2
     )
 
     mask_context = (kv_indices < S) & (kv_indices < anchor_expanded)
+    if sliding_window is not None:
+        # The current draft token occupies one slot in the window.
+        context_lower_bound = anchor_expanded + q_block_offsets - (sliding_window - 1)
+        mask_context = mask_context & (kv_indices >= context_lower_bound)
 
     is_draft = kv_indices >= S
     kv_block_ids = (kv_indices - S) // block_size
     mask_draft = is_draft & (q_block_ids == kv_block_ids)
+    if sliding_window is not None:
+        kv_block_offsets = (kv_indices - S) % block_size
+        mask_draft = mask_draft & (kv_block_offsets <= q_block_offsets)
 
     valid_block = block_keep_mask.view(B, 1, N, 1).repeat_interleave(block_size, dim=2)
 
@@ -83,21 +103,17 @@ def create_dflash_block_mask(
     S: int,
     block_size: int,
     device: torch.device,
+    flex_block_size=None,
+    sliding_window: Optional[int] = None,
 ):
-    """Construct Flex Attention BlockMask for DFlash training.
+    """Construct a full or sliding Flex Attention mask for DFlash training."""
 
-    KV: [Context (S tokens) | Block_0 | Block_1 | ... | Block_{n-1}]
-    Q:  [Block_0 | Block_1 | ... | Block_{n-1}]
-
-    Rules:
-      1. Each block sees context strictly before its anchor (kv_idx < anchor_pos).
-      2. Intra-block attention is bidirectional.
-      3. Different blocks are invisible to each other.
-      4. Invalid blocks (block_keep_mask=False) see nothing.
-    """
+    if sliding_window is not None and sliding_window <= 0:
+        raise ValueError("sliding_window must be > 0")
 
     def dflash_mask_mod(b, h, q_idx, kv_idx):
         q_block_id = q_idx // block_size
+        q_block_offset = q_idx % block_size
         safe_q_block_id = q_block_id.clamp(max=N - 1)
         anchor_pos = anchor_positions[b, safe_q_block_id]
 
@@ -105,10 +121,17 @@ def create_dflash_block_mask(
         # Strictly less than: matches inference where target_hidden[anchor_pos]
         # is not available as context.
         mask_context = is_context & (kv_idx < anchor_pos)
+        if sliding_window is not None:
+            # The current draft token occupies one slot in the window.
+            context_lower_bound = anchor_pos + q_block_offset - (sliding_window - 1)
+            mask_context = mask_context & (kv_idx >= context_lower_bound)
 
         is_draft = kv_idx >= S
         kv_block_id = (kv_idx - S) // block_size
         mask_draft = is_draft & (q_block_id == kv_block_id)
+        if sliding_window is not None:
+            kv_block_offset = (kv_idx - S) % block_size
+            mask_draft = mask_draft & (kv_block_offset <= q_block_offset)
 
         is_valid_block = block_keep_mask[b, safe_q_block_id]
         in_bounds = q_block_id < N
@@ -118,8 +141,17 @@ def create_dflash_block_mask(
     Q_LEN = N * block_size
     KV_LEN = S + N * block_size
 
+    kwargs = {}
+    if flex_block_size is not None:
+        kwargs["BLOCK_SIZE"] = flex_block_size
     return create_block_mask(
-        dflash_mask_mod, B=B, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=device
+        dflash_mask_mod,
+        B=B,
+        H=None,
+        Q_LEN=Q_LEN,
+        KV_LEN=KV_LEN,
+        device=device,
+        **kwargs,
     )
 
 
@@ -231,40 +263,35 @@ class OnlineDFlashModel(nn.Module):
     def _sample_anchor_positions(
         self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Randomly sample anchor positions per sample; returns (anchors, keep_mask)."""
-        bs = self.block_size
-        bsz = loss_mask.shape[0]
-        max_anchor = max(seq_len - bs, 0)
+        """Sample anchors whose clean token and first target are supervised."""
 
-        valid = loss_mask[:, : max_anchor + 1] > 0.5
+        num_candidates = max(seq_len - 1, 0)
+        valid = (loss_mask[:, :num_candidates] > 0.5) & (
+            loss_mask[:, 1 : num_candidates + 1] > 0.5
+        )
         valid_counts = valid.sum(dim=1)
-        max_n = min(self.num_anchors, int(valid_counts.max().item()) - 1)
+        width = min(self.num_anchors, int(valid_counts.max().item()))
+        if width == 0:
+            raise ValueError(
+                "DFlash-family training requires two consecutive supervised tokens"
+            )
 
-        if max_n <= 0:
-            raise ValueError("should preprocess the data.")
-
-        indices = (
-            torch.arange(max_anchor + 1, device=device).unsqueeze(0).expand(bsz, -1)
-        )
-        masked_indices = torch.where(
-            valid, indices, torch.tensor(seq_len + 1, device=device)
-        )
-
-        random_vals = torch.rand(bsz, max_anchor + 1, device=device)
-        random_vals = torch.where(valid, random_vals, torch.tensor(2.0, device=device))
-
-        _, sorted_idx = random_vals.sort(dim=1)
-        gathered = torch.gather(masked_indices, 1, sorted_idx)
-        anchors = gathered[:, :max_n].sort(dim=1).values
-
-        keep_mask = torch.arange(max_n, device=device).unsqueeze(
+        random_values = torch.rand(valid.shape, device=device)
+        random_values.masked_fill_(~valid, 2.0)
+        candidates = random_values.argsort(dim=1)[:, :width]
+        keep_mask = torch.arange(width, device=device).unsqueeze(
             0
-        ) < valid_counts.unsqueeze(1).clamp(max=max_n)
-        anchors = torch.where(
-            keep_mask, anchors, torch.tensor(0, dtype=torch.long, device=device)
-        )
+        ) < valid_counts.clamp(max=width).unsqueeze(1)
 
-        return anchors, keep_mask
+        sentinel = valid.shape[1]
+        anchors = torch.where(
+            keep_mask,
+            candidates,
+            torch.full_like(candidates, sentinel),
+        )
+        anchors = anchors.sort(dim=1).values
+        keep_mask = anchors < sentinel
+        return torch.where(keep_mask, anchors, 0), keep_mask
 
     def _create_position_ids(self, anchor_positions: torch.Tensor) -> torch.Tensor:
         """Create absolute position IDs for parallel draft blocks."""
@@ -354,22 +381,35 @@ class OnlineDFlashModel(nn.Module):
         draft_position_ids = self._create_position_ids(anchor_positions)
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
 
-        if self.attention_backend == "flex_attention":
-            dflash_attn_mask = create_dflash_block_mask(
-                anchor_positions=anchor_positions,
-                block_keep_mask=block_keep_mask,
-                S=seq_len,
-                block_size=self.block_size,
-                device=device,
-            )
-        else:
-            dflash_attn_mask = create_dflash_sdpa_mask(
-                anchor_positions=anchor_positions,
-                block_keep_mask=block_keep_mask,
-                S=seq_len,
-                block_size=self.block_size,
-                device=device,
-            )
+        mask_builder = (
+            create_dflash_block_mask
+            if self.attention_backend == "flex_attention"
+            else create_dflash_sdpa_mask
+        )
+        mask_args = {
+            "anchor_positions": anchor_positions,
+            "block_keep_mask": block_keep_mask,
+            "S": seq_len,
+            "block_size": self.block_size,
+            "device": device,
+        }
+        if (
+            self.attention_backend == "flex_attention"
+            and flex_attention_backend() == "FLASH"
+        ):
+            # FLASH requires a minimum of this block size.
+            mask_args["flex_block_size"] = (256, 128)
+        full_attn_mask = mask_builder(**mask_args)
+        sliding_window = self.draft_model.sliding_window
+        dflash_attn_mask = full_attn_mask
+        if sliding_window is not None:
+            dflash_attn_mask = {
+                "full_attention": full_attn_mask,
+                "sliding_attention": mask_builder(
+                    **mask_args,
+                    sliding_window=sliding_window,
+                ),
+            }
 
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
@@ -437,7 +477,7 @@ class OnlineDFlashModel(nn.Module):
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel block-wise training forward pass; returns
         (loss, accuracy, metrics) — same shape as Domino's forward."""
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
@@ -495,13 +535,20 @@ class OnlineDFlashModel(nn.Module):
             chunk_size=self.objective_chunk_blocks,
             dim=1,
         )
-        if self.loss_type == "dflash":
-            loss = loss_num / (loss_den + 1e-6)
-        else:
-            loss = loss_num / float(bsz)
-        accuracy = correct_num / (accuracy_denom + 1e-6)
-
-        return loss, accuracy, {"accuracy_denom": accuracy_denom.detach()}
+        ratio_metrics = {
+            "acc": (correct_num.detach(), accuracy_denom.detach()),
+        }
+        metrics: Dict[str, object] = {
+            "accuracy_denom": accuracy_denom.detach(),
+            "ratio_metrics": ratio_metrics,
+        }
+        loss_denominator = (
+            loss_den if self.loss_type == "dflash" else loss_num.new_tensor(float(bsz))
+        )
+        loss = loss_num / loss_denominator
+        metrics["loss_terms"] = (loss_num, loss_denominator.detach())
+        accuracy = correct_num / accuracy_denom
+        return loss, accuracy, metrics
 
 
 class OnlineDominoModel(OnlineDFlashModel):
@@ -533,41 +580,6 @@ class OnlineDominoModel(OnlineDFlashModel):
             loss_type="dflash",
         )
         self.shift_label = shift_label
-
-    def _sample_anchor_positions(
-        self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Randomly sample anchor positions per sample; returns (anchors, keep_mask)."""
-        bs = self.block_size
-        bsz = loss_mask.shape[0]
-        max_anchor = max(seq_len - bs, 0)
-
-        valid = loss_mask[:, : max_anchor + 1] > 0.5
-        valid_counts = valid.sum(dim=1)
-        max_n = max(1, min(self.num_anchors, int(valid_counts.max().item()) - 1))
-
-        indices = (
-            torch.arange(max_anchor + 1, device=device).unsqueeze(0).expand(bsz, -1)
-        )
-        masked_indices = torch.where(
-            valid, indices, torch.tensor(seq_len + 1, device=device)
-        )
-
-        random_vals = torch.rand(bsz, max_anchor + 1, device=device)
-        random_vals = torch.where(valid, random_vals, torch.tensor(2.0, device=device))
-
-        _, sorted_idx = random_vals.sort(dim=1)
-        gathered = torch.gather(masked_indices, 1, sorted_idx)
-        anchors = gathered[:, :max_n].sort(dim=1).values
-
-        keep_mask = torch.arange(max_n, device=device).unsqueeze(
-            0
-        ) < valid_counts.unsqueeze(1).clamp(max=max_n)
-        anchors = torch.where(
-            keep_mask, anchors, torch.tensor(0, dtype=torch.long, device=device)
-        )
-
-        return anchors, keep_mask
 
     def _build_domino_head_inputs(
         self,
@@ -829,55 +841,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
         self.dspark_ce_loss_alpha = float(dspark_ce_loss_alpha)
         self.dspark_l1_loss_alpha = float(dspark_l1_loss_alpha)
         self.dspark_confidence_head_alpha = float(dspark_confidence_head_alpha)
-
-    def _build_anchor_candidate_mask(
-        self,
-        seq_len: int,
-        loss_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        num_candidates = max(seq_len - 1, 0)
-        if num_candidates == 0:
-            return loss_mask[:, :0].bool()
-        anchor_valid = loss_mask[:, :num_candidates] > 0.5
-        first_target_valid = loss_mask[:, 1 : num_candidates + 1] > 0.5
-        return anchor_valid & first_target_valid
-
-    def _sample_anchor_positions(
-        self, seq_len: int, loss_mask: torch.Tensor, device: torch.device
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Sample only anchors with a valid first target, without dummy width."""
-
-        valid = self._build_anchor_candidate_mask(seq_len, loss_mask)
-        if valid.shape[1] == 0:
-            raise ValueError("DSpark needs sequences with at least two tokens")
-        valid_counts = valid.sum(dim=1)
-        width = min(self.num_anchors, int(valid_counts.max().item()))
-        if width <= 0:
-            raise ValueError(
-                "DSpark found no valid anchor with two consecutive loss tokens"
-            )
-        indices = torch.arange(valid.shape[1], device=device).expand(
-            loss_mask.shape[0], -1
-        )
-        random_values = torch.rand(valid.shape, device=device)
-        random_values.masked_fill_(~valid, 2.0)
-        order = random_values.argsort(dim=1)
-        candidates = torch.gather(indices, 1, order)[:, :width]
-        keep_mask = torch.arange(width, device=device).unsqueeze(
-            0
-        ) < valid_counts.clamp(max=width).unsqueeze(1)
-        anchors = (
-            torch.where(
-                keep_mask,
-                candidates,
-                torch.full_like(candidates, valid.shape[1]),
-            )
-            .sort(dim=1)
-            .values
-        )
-        keep_mask = anchors < valid.shape[1]
-        anchors = torch.where(keep_mask, anchors, torch.zeros_like(anchors))
-        return anchors, keep_mask
 
     def _build_dspark_labels_and_mask(
         self,

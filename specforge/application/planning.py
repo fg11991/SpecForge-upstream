@@ -188,10 +188,11 @@ def _prunes_vocabulary(cfg: Config, algorithm: AlgorithmRegistration) -> bool:
             cfg, provider=algorithm.providers.model.draft_config
         )
     except Exception:
-        # Resolving the draft config is not this check's job to get right. When
-        # it cannot be read, keep the stricter pre-existing behaviour and demand
-        # the mapping; assembly reports the real resolution error moments later.
-        return True
+        # Resolving the draft config is not this check's job to get right. An
+        # unreadable config is not evidence that the vocabulary is pruned; let
+        # the model-loading boundary report the actual resolution error instead
+        # of raising an unrelated missing-mapping error first.
+        return False
     vocab_size = draft_cfg.get("vocab_size")
     draft_vocab_size = draft_cfg.get("draft_vocab_size") or vocab_size
     if vocab_size is None or draft_vocab_size is None:
