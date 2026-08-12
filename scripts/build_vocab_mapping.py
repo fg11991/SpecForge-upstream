@@ -149,9 +149,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-path",
         type=Path,
         default=None,
-        help=(
-            "Where to write the {t2d, d2t} file. Omit to only report coverage."
-        ),
+        help=("Where to write the {t2d, d2t} file. Omit to only report coverage."),
     )
     parser.add_argument(
         "--max-length",
@@ -292,9 +290,7 @@ def tally_loss_tokens(dataset, *, vocab_size: int, batch_size: int = 512) -> Cou
         totals += torch.bincount(flat, minlength=vocab_size)
 
     present = torch.nonzero(totals, as_tuple=False).flatten()
-    return Counter(
-        {int(token): int(totals[token]) for token in present.tolist()}
-    )
+    return Counter({int(token): int(totals[token]) for token in present.tolist()})
 
 
 def load_or_count_tokens(args, *, vocab_size: int, counts_cache: Path) -> Counter:

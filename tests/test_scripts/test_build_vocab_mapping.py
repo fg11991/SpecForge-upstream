@@ -300,9 +300,7 @@ class BuildVocabMappingTest(unittest.TestCase):
 
         from scripts.build_vocab_mapping import tally_loss_tokens
 
-        dataset = Dataset.from_dict(
-            {"input_ids": [[VOCAB_SIZE]], "loss_mask": [[1]]}
-        )
+        dataset = Dataset.from_dict({"input_ids": [[VOCAB_SIZE]], "loss_mask": [[1]]})
         with self.assertRaisesRegex(ValueError, "outside the draft config"):
             tally_loss_tokens(dataset, vocab_size=VOCAB_SIZE)
 

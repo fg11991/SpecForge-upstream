@@ -387,9 +387,7 @@ class DSparkDraftVocabTest(unittest.TestCase):
 
         # Every label is in vocabulary, so the CE evaluation set is the full one.
         self.assertTrue(torch.equal(ce_eval_den, eval_mask.float().sum()))
-        self.assertTrue(
-            torch.equal(ce_position_den, eval_mask.float().sum(dim=(0, 1)))
-        )
+        self.assertTrue(torch.equal(ce_position_den, eval_mask.float().sum(dim=(0, 1))))
 
     def test_pruned_objective_trains_and_reports_coverage(self):
         pruned, model = _build(DRAFT_VOCAB_SIZE)

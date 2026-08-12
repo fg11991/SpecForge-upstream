@@ -997,9 +997,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 else:
                     target_probabilities = teacher_conditional
             draft_probabilities = torch.softmax(draft_logits.float(), dim=-1)
-            l1_per_token = (
-                (draft_probabilities - teacher_conditional).abs().sum(dim=-1)
-            )
+            l1_per_token = (draft_probabilities - teacher_conditional).abs().sum(dim=-1)
             if self.use_draft_vocab:
                 # sum_i min(q_i, p_i) over the kept tokens: the exact single-step
                 # acceptance rate for a draft that can only propose them. Bounded
@@ -1009,9 +1007,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
                     .sum(dim=-1)
                     .clamp(0.0, 1.0)
                 )
-                kept_mass_num = (
-                    target_probabilities.sum(dim=-1) * eval_mask
-                ).sum()
+                kept_mass_num = (target_probabilities.sum(dim=-1) * eval_mask).sum()
             else:
                 # Algebraically the same quantity when the teacher sums to one.
                 # Kept as the original expression so the unpruned path stays

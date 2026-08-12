@@ -17,9 +17,7 @@ INKLING_TWO_NODE = ROOT / "examples" / "disagg" / "run_inkling_dspark_disagg_2no
 KIMI_K3_CAPTURE_PATCH = (
     ROOT / "patches" / "sglang" / "kimi-k3-f8493a4" / "spec-capture.patch"
 )
-V0514_CAPTURE_PATCH = (
-    ROOT / "patches" / "sglang" / "v0.5.14" / "spec-capture.patch"
-)
+V0514_CAPTURE_PATCH = ROOT / "patches" / "sglang" / "v0.5.14" / "spec-capture.patch"
 
 
 class DisaggregatedWrapperTest(unittest.TestCase):

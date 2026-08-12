@@ -11,13 +11,13 @@ import torch
 
 from specforge.algorithms.builtin import builtin_algorithm_registry
 from specforge.config import Config
+from specforge.data.vocab_mapping import count_effective_feature_tokens
 from specforge.modeling.draft.vocab_mixin import DraftVocabMappingMixin
 from specforge.training.assembly import (
     _ensure_offline_vocab_mapping,
     _install_dataset_vocab_mapping,
     _prompt_cache_key,
 )
-from specforge.data.vocab_mapping import count_effective_feature_tokens
 
 ALGORITHM = builtin_algorithm_registry().resolve("eagle3")
 

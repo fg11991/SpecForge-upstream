@@ -519,9 +519,7 @@ class PrepareHiddenStatesVocabMappingTest(unittest.TestCase):
                 mock.patch(
                     "scripts.prepare_hidden_states.dist.get_rank", return_value=0
                 ),
-                mock.patch(
-                    "scripts.prepare_hidden_states.dist.broadcast_object_list"
-                ),
+                mock.patch("scripts.prepare_hidden_states.dist.broadcast_object_list"),
             ):
                 actual = _reuse_shared_vocab_mapping(
                     str(mapping_path),
@@ -545,9 +543,7 @@ class PrepareHiddenStatesVocabMappingTest(unittest.TestCase):
                 mock.patch(
                     "scripts.prepare_hidden_states.dist.get_rank", return_value=0
                 ),
-                mock.patch(
-                    "scripts.prepare_hidden_states.dist.broadcast_object_list"
-                ),
+                mock.patch("scripts.prepare_hidden_states.dist.broadcast_object_list"),
                 self.assertRaisesRegex(RuntimeError, "expected \\(4,\\)"),
             ):
                 _reuse_shared_vocab_mapping(

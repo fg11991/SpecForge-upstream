@@ -115,9 +115,7 @@ class TestScanOfflineFeatureEligibility(unittest.TestCase):
                 json.loads(completed.stdout)["invalid_after_truncation"], 1
             )
             self.assertEqual(json.loads(completed.stdout)["unreadable_files"], 1)
-            self.assertIn(
-                "streaming fallback summary: files=1", completed.stderr
-            )
+            self.assertIn("streaming fallback summary: files=1", completed.stderr)
             invalid_names = {
                 Path(path).name
                 for path in invalid_output.read_text(encoding="utf-8").splitlines()
