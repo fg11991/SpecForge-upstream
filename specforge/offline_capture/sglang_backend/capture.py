@@ -10,8 +10,8 @@
 
 from __future__ import annotations
 
-from array import array
 import logging
+from array import array
 from typing import List, Optional
 
 import torch
@@ -31,7 +31,6 @@ from specforge.distributed import get_tp_group
 
 from .model_runner import SGLangRunner
 from .utils import wrap_offline_eagle3_logits_processors
-
 
 logger = logging.getLogger(__name__)
 

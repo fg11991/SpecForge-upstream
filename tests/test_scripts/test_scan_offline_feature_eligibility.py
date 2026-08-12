@@ -34,7 +34,9 @@ class TestScanOfflineFeatureEligibility(unittest.TestCase):
             _write_feature(root / "late.ckpt.gz", [0, 0, 0, 0, 1, 1])
             _write_feature(root / "separated.ckpt", [1, 0, 1, 0, 1, 0])
 
-            report, invalid_paths = scan_feature_directory(root, max_length=4)
+            report, invalid_paths = scan_feature_directory(
+                root, max_length=4, num_workers=1
+            )
 
             self.assertEqual(report.total_files, 3)
             self.assertEqual(report.compatible_after_truncation, 1)
@@ -51,8 +53,10 @@ class TestScanOfflineFeatureEligibility(unittest.TestCase):
             root = Path(directory)
             _write_feature(root / "invalid.ckpt", [1, 0, 1])
             invalid_output = root / "invalid.txt"
-            script = Path(__file__).parents[2] / "scripts" / Path(
-                "scan_offline_feature_eligibility.py"
+            script = (
+                Path(__file__).parents[2]
+                / "scripts"
+                / Path("scan_offline_feature_eligibility.py")
             )
 
             completed = subprocess.run(
@@ -63,6 +67,8 @@ class TestScanOfflineFeatureEligibility(unittest.TestCase):
                     str(root),
                     "--max-length",
                     "3",
+                    "--num-workers",
+                    "1",
                     "--invalid-paths-output",
                     str(invalid_output),
                     "--json",
@@ -77,7 +83,9 @@ class TestScanOfflineFeatureEligibility(unittest.TestCase):
             )
 
             self.assertEqual(completed.returncode, 1, completed.stderr)
-            self.assertEqual(json.loads(completed.stdout)["invalid_after_truncation"], 1)
+            self.assertEqual(
+                json.loads(completed.stdout)["invalid_after_truncation"], 1
+            )
             self.assertIn("invalid.ckpt", invalid_output.read_text(encoding="utf-8"))
 
 

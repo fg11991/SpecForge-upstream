@@ -51,9 +51,14 @@ import io
 import itertools
 import logging
 import os
+import pickle
+import struct
+import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -239,6 +244,313 @@ def load_feature_file(path: str) -> Dict[str, torch.Tensor]:
         with gzip.open(path, "rb") as f:
             return torch.load(io.BytesIO(f.read()), weights_only=False)
     return torch.load(path, weights_only=False, mmap=True)
+
+
+_ZIP_LOCAL_HEADER = b"PK\x03\x04"
+_ZIP_DATA_DESCRIPTOR = b"PK\x07\x08"
+_ZIP_STORED = 0
+_ZIP_DATA_DESCRIPTOR_FLAG = 0x08
+_STREAM_CHUNK_SIZE = 64 << 10
+_LARGE_PRECEDING_STORAGE_BYTES = 8 << 20
+
+_STORAGE_DTYPES = {
+    "ByteStorage": torch.uint8,
+    "CharStorage": torch.int8,
+    "ShortStorage": torch.int16,
+    "IntStorage": torch.int32,
+    "LongStorage": torch.int64,
+    "HalfStorage": torch.float16,
+    "FloatStorage": torch.float32,
+    "DoubleStorage": torch.float64,
+    "BoolStorage": torch.bool,
+    "BFloat16Storage": torch.bfloat16,
+}
+
+
+@dataclass(frozen=True)
+class _StoragePlaceholder:
+    key: str
+    dtype: torch.dtype
+    numel: int
+
+
+@dataclass(frozen=True)
+class _TensorPlaceholder:
+    storage: _StoragePlaceholder
+    storage_offset: int
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+
+
+class _PushbackReader:
+    """Small unread buffer for a non-seekable gzip stream."""
+
+    def __init__(self, stream) -> None:
+        self.stream = stream
+        self.pending = bytearray()
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            prefix = bytes(self.pending)
+            self.pending.clear()
+            return prefix + self.stream.read()
+        if size == 0:
+            return b""
+        prefix = bytes(self.pending[:size])
+        del self.pending[:size]
+        if len(prefix) == size:
+            return prefix
+        return prefix + self.stream.read(size - len(prefix))
+
+    def unread(self, data: bytes) -> None:
+        if data:
+            self.pending[:0] = data
+
+
+def _read_exact(stream: _PushbackReader, size: int) -> bytes:
+    chunks = bytearray()
+    while len(chunks) < size:
+        chunk = stream.read(size - len(chunks))
+        if not chunk:
+            raise EOFError(f"unexpected EOF after {len(chunks)}/{size} bytes")
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def _read_stored_zip_member(
+    stream: _PushbackReader,
+    *,
+    flags: int,
+    method: int,
+    compressed_size: int,
+    uncompressed_size: int,
+) -> bytes:
+    if method != _ZIP_STORED:
+        raise ValueError(f"streaming reader requires ZIP_STORED, got method={method}")
+    if not flags & _ZIP_DATA_DESCRIPTOR_FLAG:
+        if compressed_size != uncompressed_size:
+            raise ValueError("stored ZIP member has different compressed sizes")
+        return _read_exact(stream, compressed_size)
+
+    # PyTorch's streaming writer leaves sizes at zero and terminates each member
+    # with the signed 32-bit data descriptor. A tensor may contain the signature
+    # by chance, so accept it only when both declared sizes equal bytes consumed.
+    data_parts: list[bytes] = []
+    buffered = bytearray()
+    committed = 0
+    while True:
+        chunk = stream.read(_STREAM_CHUNK_SIZE)
+        if not chunk:
+            raise EOFError("ZIP data descriptor was not found")
+        buffered.extend(chunk)
+        search_from = 0
+        while True:
+            marker = buffered.find(_ZIP_DATA_DESCRIPTOR, search_from)
+            if marker < 0 or len(buffered) < marker + 16:
+                break
+            _crc, actual_compressed, actual_uncompressed = struct.unpack_from(
+                "<III", buffered, marker + 4
+            )
+            member_size = committed + marker
+            if actual_compressed == actual_uncompressed == member_size:
+                data_parts.append(bytes(buffered[:marker]))
+                stream.unread(bytes(buffered[marker + 16 :]))
+                return b"".join(data_parts)
+            search_from = marker + 1
+        # Retain enough bytes for a marker/descriptor split across reads.
+        if len(buffered) > 15:
+            flush_size = len(buffered) - 15
+            data_parts.append(bytes(buffered[:flush_size]))
+            del buffered[:flush_size]
+            committed += flush_size
+
+
+class _MetadataUnpickler(pickle.Unpickler):
+    """Decode tensor metadata without constructing or reading storages."""
+
+    def persistent_load(self, saved_id):
+        if not isinstance(saved_id, tuple) or len(saved_id) < 5:
+            raise pickle.UnpicklingError("unexpected persistent id")
+        kind, storage_type, key, _location, numel = saved_id[:5]
+        if kind != "storage":
+            raise pickle.UnpicklingError(f"unsupported persistent id {kind!r}")
+        dtype = _STORAGE_DTYPES.get(getattr(storage_type, "__name__", ""))
+        if dtype is None:
+            raise pickle.UnpicklingError(f"unsupported storage type {storage_type!r}")
+        return _StoragePlaceholder(str(key), dtype, int(numel))
+
+    def find_class(self, module: str, name: str):
+        if module == "torch" and name in _STORAGE_DTYPES:
+            return getattr(torch, name)
+        if module == "torch._utils" and name in {
+            "_rebuild_tensor",
+            "_rebuild_tensor_v2",
+            "_rebuild_tensor_v3",
+        }:
+            return self._rebuild_tensor
+        if module == "collections" and name == "OrderedDict":
+            return OrderedDict
+        raise pickle.UnpicklingError(f"blocked pickle global {module}.{name}")
+
+    @staticmethod
+    def _rebuild_tensor(storage, storage_offset, size, stride, *_unused):
+        if not isinstance(storage, _StoragePlaceholder):
+            raise pickle.UnpicklingError("tensor does not reference a storage")
+        return _TensorPlaceholder(
+            storage=storage,
+            storage_offset=int(storage_offset),
+            shape=tuple(int(value) for value in size),
+            stride=tuple(int(value) for value in stride),
+        )
+
+
+def _storage_nbytes(storage: _StoragePlaceholder) -> int:
+    return storage.numel * torch.empty((), dtype=storage.dtype).element_size()
+
+
+def _tensor_from_storage_bytes(
+    raw: bytes,
+    placeholder: _TensorPlaceholder,
+) -> torch.Tensor:
+    storage = placeholder.storage
+    if len(raw) != _storage_nbytes(storage):
+        raise ValueError(
+            f"storage {storage.key} has {len(raw)} bytes, expected "
+            f"{_storage_nbytes(storage)}"
+        )
+    # bytearray makes the buffer writable and lets clone() return independent
+    # tensor storage before the temporary is released.
+    flat = torch.frombuffer(bytearray(raw), dtype=storage.dtype)
+    return torch.as_strided(
+        flat,
+        size=placeholder.shape,
+        stride=placeholder.stride,
+        storage_offset=placeholder.storage_offset,
+    ).clone()
+
+
+def _read_torch_save_keys_from_stream(stream, keys: Tuple[str, ...]):
+    reader = _PushbackReader(stream)
+    metadata = None
+    wanted: Dict[str, list[_TensorPlaceholder]] = {}
+    storage_order: list[_StoragePlaceholder] = []
+    storage_bytes: Dict[str, bytes] = {}
+    archive_prefix = None
+    byteorder = sys.byteorder
+
+    while metadata is None or len(storage_bytes) < len(wanted):
+        signature = reader.read(4)
+        if signature != _ZIP_LOCAL_HEADER:
+            raise ValueError(f"expected ZIP local header, got {signature!r}")
+        header = _read_exact(reader, 26)
+        (
+            _version,
+            flags,
+            method,
+            _mtime,
+            _mdate,
+            _crc,
+            compressed_size,
+            uncompressed_size,
+            name_length,
+            extra_length,
+        ) = struct.unpack("<HHHHHIIIHH", header)
+        name = _read_exact(reader, name_length).decode("utf-8")
+        _read_exact(reader, extra_length)
+        member = _read_stored_zip_member(
+            reader,
+            flags=flags,
+            method=method,
+            compressed_size=compressed_size,
+            uncompressed_size=uncompressed_size,
+        )
+
+        if name.endswith("/data.pkl"):
+            archive_prefix = name[: -len("data.pkl")]
+            metadata = _MetadataUnpickler(io.BytesIO(member)).load()
+            if not isinstance(metadata, dict):
+                raise ValueError("torch-save metadata is not a dictionary")
+            missing = [key for key in keys if key not in metadata]
+            if missing:
+                raise KeyError(f"feature file is missing keys {missing}")
+            for key in keys:
+                tensor = metadata[key]
+                if not isinstance(tensor, _TensorPlaceholder):
+                    raise ValueError(f"feature {key!r} is not a tensor")
+                wanted.setdefault(tensor.storage.key, []).append(tensor)
+            for value in metadata.values():
+                if isinstance(value, _TensorPlaceholder):
+                    storage_order.append(value.storage)
+            target_positions = [
+                index
+                for index, storage in enumerate(storage_order)
+                if storage.key in wanted
+            ]
+            if not target_positions:
+                raise ValueError("target tensors have no storage metadata")
+            last_target = max(target_positions)
+            for storage in storage_order[:last_target]:
+                if (
+                    storage.key not in wanted
+                    and _storage_nbytes(storage) > _LARGE_PRECEDING_STORAGE_BYTES
+                ):
+                    raise ValueError(
+                        "target storage follows a large tensor; streaming would "
+                        "not reduce decompression"
+                    )
+        elif archive_prefix is None or metadata is None:
+            raise ValueError("archive/data.pkl must be the first ZIP member")
+        elif name == archive_prefix + "byteorder":
+            byteorder = member.decode("ascii")
+            if byteorder != sys.byteorder:
+                raise ValueError(f"cross-endian torch save is unsupported: {byteorder}")
+        elif name.startswith(archive_prefix + "data/"):
+            storage_key = name[len(archive_prefix + "data/") :]
+            if storage_key in wanted:
+                storage_bytes[storage_key] = member
+
+    if byteorder != sys.byteorder:
+        raise ValueError(f"cross-endian torch save is unsupported: {byteorder}")
+    return {
+        key: _tensor_from_storage_bytes(
+            storage_bytes[metadata[key].storage.key], metadata[key]
+        )
+        for key in keys
+    }
+
+
+def read_feature_keys_streaming(
+    path: str,
+    keys: Tuple[str, ...],
+    *,
+    _gzip_open: Callable[..., Any] = gzip.open,
+    _fallback_loader: Callable[[str], Dict[str, torch.Tensor]] = load_feature_file,
+) -> Dict[str, torch.Tensor]:
+    """Read selected feature tensors, stopping early in gzip torch-save files.
+
+    The fast path understands the ordered, ZIP_STORED stream emitted by
+    ``torch.save``. Any format or ordering it cannot prove safe falls back to
+    :func:`load_feature_file`; optimization failures can only make a scan
+    slower, never change its result.
+    """
+
+    requested = tuple(dict.fromkeys(keys))
+    if not requested:
+        return {}
+    if not path.endswith(".gz"):
+        raw = _fallback_loader(path)
+        return {key: raw[key] for key in requested}
+    try:
+        with _gzip_open(path, "rb") as stream:
+            return _read_torch_save_keys_from_stream(stream, requested)
+    except Exception as exc:
+        logger.warning(
+            "streaming feature read fell back to full load for %s: %s",
+            path,
+            exc,
+        )
+        raw = _fallback_loader(path)
+        return {key: raw[key] for key in requested}
 
 
 class LocalFeatureStore(FeatureStore):

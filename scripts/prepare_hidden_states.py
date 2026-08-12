@@ -366,6 +366,21 @@ def _generate_shared_vocab_mapping(
     return mapping_path
 
 
+def _validate_bounded_vocab_mapping(
+    *,
+    candidate_samples: Optional[int],
+    draft_vocab_size: int,
+    target_vocab_size: int,
+) -> None:
+    if candidate_samples is not None and draft_vocab_size < target_vocab_size:
+        raise ValueError(
+            "--filter-candidate-samples cannot generate a pruned vocabulary "
+            "mapping: a bounded smoke candidate set produces unstable t2d/d2t "
+            "that could be mistaken for the full-corpus mapping. Omit the flag "
+            "when draft_vocab_size < target vocab_size."
+        )
+
+
 def _sglang_kwargs(args: argparse.Namespace) -> Dict[str, object]:
     return {
         "attention_backend": args.sglang_attention_backend,
@@ -857,9 +872,7 @@ def main():
                 "post-filter sample target is explicit"
             )
         if args.filter_candidate_samples < args.num_samples:
-            raise ValueError(
-                "--filter-candidate-samples must be >= --num-samples"
-            )
+            raise ValueError("--filter-candidate-samples must be >= --num-samples")
 
     # Initialize distributed environment (TP + DP)
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
@@ -889,6 +902,11 @@ def main():
             f"draft_vocab_size={draft_vocab_size} exceeds target "
             f"vocab_size={target_vocab_size}"
         )
+    _validate_bounded_vocab_mapping(
+        candidate_samples=args.filter_candidate_samples,
+        draft_vocab_size=draft_vocab_size,
+        target_vocab_size=target_vocab_size,
+    )
 
     print_with_rank(
         f"DP Rank {dist.get_rank(get_dp_group())}, TP Rank {dist.get_rank(get_tp_group())}, "

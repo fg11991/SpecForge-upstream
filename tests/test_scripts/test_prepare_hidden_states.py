@@ -13,6 +13,7 @@ from scripts.prepare_hidden_states import (
     HiddenStatesGenerator,
     _generate_shared_vocab_mapping,
     _resolve_draft_vocab_size,
+    _validate_bounded_vocab_mapping,
     build_processed_dataset,
     build_target_model,
     parse_args,
@@ -195,6 +196,21 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
             )
 
         self.assertEqual(256, build_dataset.call_args.kwargs["candidate_samples"])
+
+    def test_bounded_smoke_is_rejected_for_pruned_vocab_mapping(self):
+        with self.assertRaisesRegex(ValueError, "bounded smoke candidate set"):
+            _validate_bounded_vocab_mapping(
+                candidate_samples=256,
+                draft_vocab_size=32_000,
+                target_vocab_size=151_936,
+            )
+
+    def test_bounded_smoke_allows_full_vocab_without_mapping(self):
+        _validate_bounded_vocab_mapping(
+            candidate_samples=256,
+            draft_vocab_size=151_936,
+            target_vocab_size=151_936,
+        )
 
     def test_strategy_capture_plans_use_draft_owned_layers_and_schemas(self):
         expected = {
