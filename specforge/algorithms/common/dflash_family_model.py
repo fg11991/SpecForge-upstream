@@ -1371,11 +1371,16 @@ class OnlineDSparkModel(OnlineDFlashModel):
             raise ValueError(
                 "flex_attention is not available on this device; use sdpa/eager."
             )
-        anchor_positions, block_keep_mask, output_hidden = self._forward_draft_blocks(
-            input_ids=input_ids,
-            hidden_states=hidden_states,
-            loss_mask=loss_mask,
-        )
+        from specforge.training.step_profile import phase
+
+        with phase("draft_blocks"):
+            anchor_positions, block_keep_mask, output_hidden = (
+                self._forward_draft_blocks(
+                    input_ids=input_ids,
+                    hidden_states=hidden_states,
+                    loss_mask=loss_mask,
+                )
+            )
 
         (
             target_ids,
@@ -1392,13 +1397,14 @@ class OnlineDSparkModel(OnlineDFlashModel):
             [anchor_token_ids.unsqueeze(-1), target_ids[:, :, :-1]],
             dim=-1,
         )
-        loss, metrics = self._compute_dspark_loss(
-            output_hidden=output_hidden,
-            target_ids=target_ids,
-            eval_mask=eval_mask,
-            prev_token_ids=prev_token_ids,
-            safe_label_indices=safe_label_indices,
-            target_last_hidden_states=target_last_hidden_states,
-        )
+        with phase("objective"):
+            loss, metrics = self._compute_dspark_loss(
+                output_hidden=output_hidden,
+                target_ids=target_ids,
+                eval_mask=eval_mask,
+                prev_token_ids=prev_token_ids,
+                safe_label_indices=safe_label_indices,
+                target_last_hidden_states=target_last_hidden_states,
+            )
         accuracy = metrics.pop("accuracy")
         return loss, accuracy, metrics

@@ -319,6 +319,8 @@ class TrainerCore:
         self.accumulation_steps = max(1, accumulation_steps)
         self._micro = 0
         self._ratio_totals: Dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._loss_total: Optional[torch.Tensor] = None
+        self._loss_micro = 0
 
     @property
     def accumulation_remainder(self) -> int:
@@ -328,7 +330,10 @@ class TrainerCore:
     def train_step(
         self, batch: TrainBatch, ctx: Optional[StepContext] = None
     ) -> StepResult:
-        out: StepOutput = self.strategy.forward_loss(batch, ctx)
+        from specforge.training.step_profile import phase
+
+        with phase("forward"):
+            out: StepOutput = self.strategy.forward_loss(batch, ctx)
         loss = out.loss
         ratio_metrics = dict(out.ratio_metrics)
         if out.loss_terms is not None:
@@ -342,15 +347,33 @@ class TrainerCore:
                 denominator,
             )
         self._accumulate_ratio_metrics(ratio_metrics)
+        # Strategies that normalise the loss inside the model (DSpark) publish
+        # no loss_terms, and the scalar fallback in _result reports out.loss --
+        # the LAST micro-batch alone, while every other metric is a mean over
+        # the whole window. At batch_size 1 that made train/loss a
+        # one-sequence sample against everyone else's four, so it swung about
+        # twice as wide and could not be reconciled with its own components.
+        # Accumulate it here instead. Staying on the scalar path keeps the
+        # metric reduction at one collective per optimizer step.
+        detached_loss = out.loss.detach().reshape(())
+        self._loss_total = (
+            detached_loss
+            if self._loss_micro == 0
+            else self._loss_total + detached_loss
+        )
+        self._loss_micro += 1
         loss = loss / self.accumulation_steps
         self._micro += 1
         # The boundary is known before backward so the backend can defer the FSDP
         # gradient reduction (no_sync) on non-boundary micro-steps.
         stepped = self._micro % self.accumulation_steps == 0
-        self.backend.backward(loss, is_boundary=stepped)
+        with phase("backward"):
+            self.backend.backward(loss, is_boundary=stepped)
         if stepped and out.loss_terms is not None:
-            self._normalize_gradients(self._ratio_totals["loss"][1])
-        grad_norm = self.backend.step() if stepped else None
+            with phase("grad_normalize"):
+                self._normalize_gradients(self._ratio_totals["loss"][1])
+        with phase("optimizer"):
+            grad_norm = self.backend.step() if stepped else None
         result_ratio_metrics = self._ratio_totals if stepped else ratio_metrics
         result = self._result(
             out,
@@ -360,6 +383,8 @@ class TrainerCore:
         )
         if stepped:
             self._ratio_totals = {}
+            self._loss_total = None
+            self._loss_micro = 0
         return result
 
     def _accumulate_ratio_metrics(self, values: Dict[str, Any]) -> None:
@@ -432,7 +457,11 @@ class TrainerCore:
         )
         scalar_metrics: Dict[str, torch.Tensor] = {}
         if "loss" not in metrics:
-            scalar_metrics["loss"] = out.loss
+            scalar_metrics["loss"] = (
+                out.loss
+                if self._loss_micro == 0
+                else self._loss_total / self._loss_micro
+            )
         if "accuracy" in out.metrics and "acc" not in metrics:
             accuracy = out.metrics["accuracy"]
             if isinstance(accuracy, torch.Tensor):
@@ -698,8 +727,11 @@ class TrainerController:
                     parallel = getattr(self.core.backend, "parallel_config", None)
                     world_size = int(getattr(parallel, "world_size", 1))
                     tp_size = int(getattr(parallel, "tp_size", 1))
+                    ep_size = int(getattr(parallel, "expert_parallel_size", 1))
                     sp_size = int(getattr(parallel, "sp_size", 1))
-                    data_parallel_size = max(1, world_size // (tp_size * sp_size))
+                    data_parallel_size = max(
+                        1, world_size // (tp_size * ep_size * sp_size)
+                    )
                     log_metrics.update(
                         {
                             "perf/optimizer_steps_per_hour": (
@@ -724,6 +756,9 @@ class TrainerController:
                             ),
                         }
                     )
+                    from specforge.training.step_profile import drain
+
+                    log_metrics.update(drain(steps=max(1, perf_window_steps)))
                     self.logger(log_metrics, self.global_step)
                     perf_window_started = time.perf_counter()
                     perf_window_steps = 0
@@ -852,11 +887,31 @@ class TrainerController:
             getattr(self.core.backend, "optimizer_state_is_replicated", False)
         )
         shared = None
+        local_draft_state = (
+            self.core.strategy.checkpoint_state_filter(full["model"])
+            if full["model"]
+            else None
+        )
+        expert_parallel_size = int(
+            self.checkpoint_extra.get("expert_parallel_size", 1)
+        )
+        if expert_parallel_size > 1 and local_draft_state:
+            local_expert_state = {
+                name: tensor
+                for name, tensor in local_draft_state.items()
+                if ".ffn.experts." in name
+            }
+            shared_draft_state = {
+                name: tensor
+                for name, tensor in local_draft_state.items()
+                if ".ffn.experts." not in name
+            }
+        else:
+            local_expert_state = local_draft_state
+            shared_draft_state = local_draft_state
         if mgr.is_rank0():
             shared = {
-                "draft_state_dict": self.core.strategy.checkpoint_state_filter(
-                    full["model"]
-                ),
+                "draft_state_dict": shared_draft_state,
                 "global_step": step,
                 "epoch": self.epoch,
                 "epoch_batch": self._epoch_batch,
@@ -881,6 +936,10 @@ class TrainerController:
             rank_state={
                 "optimizer": None if replicated_optimizer else full["optimizer"],
                 "rng": full["rng"],
+                # With expert parallelism, each draft-DP group leader owns a
+                # different local-expert state. Persist that shard beside its
+                # optimizer so resume/export can reconstruct all mtp experts.
+                "draft_state_dict": local_expert_state,
             },
         )
         self.last_checkpoint_step = step

@@ -116,11 +116,22 @@ def _load_draft(cfg: Config, algorithm: AlgorithmRegistration):
     provider = algorithm.providers.model
     draft_config = resolve_draft_config(cfg, provider=provider.draft_config)
     draft_model = provider.build_draft(cfg, draft_config)
-    architecture = provider.draft_config.architecture
-    expected_type = resolve_draft(architecture)
-    if not isinstance(draft_model, expected_type):
+    spec = provider.draft_config
+    # An algorithm may serve several draft architectures -- DSpark covers both
+    # the generic drafter and the DeepSeek-V4 one -- so accept anything the
+    # provider declares compatible, not just its default.
+    architectures = sorted(
+        getattr(spec, "compatible_architectures", None) or {spec.architecture}
+    )
+    expected_types = tuple(resolve_draft(name) for name in architectures)
+    if not isinstance(draft_model, expected_types):
+        expected = (
+            architectures[0]
+            if len(architectures) == 1
+            else f"one of {architectures}"
+        )
         raise ValueError(
-            f"training.strategy={algorithm.name!r} requires {architecture}, but "
+            f"training.strategy={algorithm.name!r} requires {expected}, but "
             f"the resolved draft config builds "
             f"{type(draft_model).__name__}"
         )
@@ -282,6 +293,26 @@ def _optimizer_factory(cfg: Config):
     return _ConfiguredOptimizerFactory(cfg)
 
 
+LOG_ALL_RANKS_ENV = "SPECFORGE_LOG_ALL_RANKS"
+
+
+def _log_all_ranks() -> bool:
+    """Whether every rank prints its own metrics line.
+
+    Off by default: the loss and accuracy metrics are reduced before logging,
+    so every rank prints the same numbers and the console shows each step
+    world-size times. Turn it on to compare ranks -- the per-rank ``perf/*``
+    timings are the one thing rank 0 alone does not show, so a straggler is
+    invisible without it.
+    """
+    return os.environ.get(LOG_ALL_RANKS_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _logger(metrics, step):
     printable = {}
     for key, value in metrics.items():
@@ -292,7 +323,13 @@ def _logger(metrics, step):
                 printable[key] = [float(item) for item in value]
             except (TypeError, ValueError):
                 continue
-    print(f"step {step}: {printable}", flush=True)
+    import torch.distributed as torch_dist
+
+    distributed = torch_dist.is_available() and torch_dist.is_initialized()
+    rank = torch_dist.get_rank() if distributed else 0
+    if rank != 0 and not _log_all_ranks():
+        return
+    print(f"[rank {rank}] step {step}: {printable}", flush=True)
 
 
 def _configured_logger(cfg: Config):
@@ -560,6 +597,7 @@ def _common_launch_kwargs(
         log_interval=t.log_interval,
         strategy_kwargs=bundle.strategy_kwargs,
         tp_size=t.tp_size,
+        expert_parallel_size=t.expert_parallel_size,
         sp_ulysses_size=t.sp_ulysses_size,
         sp_ring_size=t.sp_ring_size,
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
