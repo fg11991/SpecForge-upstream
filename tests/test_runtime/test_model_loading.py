@@ -257,6 +257,240 @@ assert not torch.cuda.is_initialized()
         self.assertEqual(load.call_args.args[0], "org/base-draft")
 
 
+class GradNormReductionTest(unittest.TestCase):
+    """Clipping must use the same norm on every rank sharing replicated params."""
+
+    def _configure(
+        self,
+        *,
+        sharding_strategy,
+        expert_parallel_size,
+        shard_ranks=8,
+        wrapped=True,
+    ):
+        from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+
+        recorded = {}
+
+        class _Optimizer:
+            def configure_grad_norm_reduction(
+                self, *, process_group, enabled, partition_replicated=False
+            ):
+                recorded["group"] = process_group
+                recorded["enabled"] = enabled
+                recorded["partition_replicated"] = partition_replicated
+
+        backend = object.__new__(FSDPTrainingBackend)
+        backend.optimizer = _Optimizer()
+        backend._wrapped = wrapped
+        backend.parallel_config = ParallelConfig(
+            expert_parallel_size=expert_parallel_size,
+            sharding_strategy=sharding_strategy,
+            fsdp_process_group="fsdp",
+            draft_ep_group="ep",
+        )
+        sizes = {"fsdp": shard_ranks, "ep": expert_parallel_size}
+        with mock.patch("torch.distributed.is_available", return_value=True), \
+            mock.patch("torch.distributed.is_initialized", return_value=True), \
+            mock.patch(
+                "torch.distributed.get_world_size",
+                side_effect=lambda group=None: sizes.get(group, 1),
+            ):
+            backend._configure_optimizer_grad_norm()
+        return recorded
+
+    def test_sharded_run_reduces_over_the_shard_group(self):
+        recorded = self._configure(
+            sharding_strategy="SHARD_GRAD_OP", expert_parallel_size=1
+        )
+        self.assertTrue(recorded["enabled"])
+        self.assertEqual(recorded["group"], "fsdp")
+        # Every parameter is a rank-local shard here; there is nothing
+        # replicated to hold back out of the sum.
+        self.assertFalse(recorded["partition_replicated"])
+
+    def test_plain_replication_needs_no_reduction(self):
+        # Every rank holds the same parameters and gradients, so the norms match.
+        recorded = self._configure(
+            sharding_strategy="NO_SHARD", expert_parallel_size=1
+        )
+        self.assertFalse(recorded["enabled"])
+
+    def test_requested_sharding_that_degraded_to_one_rank_uses_the_expert_group(self):
+        # FSDP downgrades to NO_SHARD when the shard group holds a single rank,
+        # but sharding_strategy still records what the recipe asked for. Keying
+        # on that string reduced over a one-rank group, which is a no-op that
+        # looks configured -- and left every rank clipping by its own norm.
+        recorded = self._configure(
+            sharding_strategy="SHARD_GRAD_OP",
+            expert_parallel_size=8,
+            shard_ranks=1,
+        )
+        self.assertTrue(recorded["enabled"])
+        self.assertEqual(recorded["group"], "ep")
+        self.assertTrue(recorded["partition_replicated"])
+
+    def test_expert_parallel_replication_reduces_over_the_expert_group(self):
+        # Each rank owns a different slice of the experts, so its local norm --
+        # and therefore its clip coefficient -- differs, which would scale the
+        # replicated parameters apart on the first step.
+        recorded = self._configure(
+            sharding_strategy="NO_SHARD", expert_parallel_size=8
+        )
+        self.assertTrue(recorded["enabled"])
+        self.assertEqual(recorded["group"], "ep")
+        # Only the routed experts are disjoint. Summing the replicated
+        # attention/mHC/router squares once per rank would inflate the norm by
+        # up to sqrt(8) and clip every step that much harder.
+        self.assertTrue(recorded["partition_replicated"])
+
+
+class TargetKeyResolutionTest(unittest.TestCase):
+    """DeepSeek runtime-named checkpoints must load without CLI overrides."""
+
+    def _checkpoint(self, root, keys):
+        from safetensors.torch import save_file
+
+        save_file(
+            {key: torch.zeros(2, 2) for key in keys},
+            os.path.join(root, "quant_model_weights-00001-of-00001.safetensors"),
+        )
+        with open(
+            os.path.join(root, "quant_model_weights.safetensors.index.json"), "w"
+        ) as stream:
+            json.dump(
+                {
+                    "weight_map": {
+                        key: "quant_model_weights-00001-of-00001.safetensors"
+                        for key in keys
+                    }
+                },
+                stream,
+            )
+
+    def _resolve(self, root, embed_key, lm_head_key):
+        """Run just the index-side key resolution of _load_weights."""
+        from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
+
+        instance = object.__new__(TargetEmbeddingsAndHead)
+        recorded = {}
+
+        def fake_load_file_content(file_path, keys, target_embed_key, target_head_key):
+            recorded["keys"] = list(keys)
+            recorded["embed"] = target_embed_key
+            recorded["head"] = target_head_key
+            return set(keys)
+
+        instance._load_file_content = fake_load_file_content
+        instance._load_weights(root, embed_key, lm_head_key, False)
+        return recorded
+
+    def test_runtime_named_checkpoint_resolves_without_overrides(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._checkpoint(root, ["embed.weight", "head.weight"])
+            recorded = self._resolve(
+                root, "model.embed_tokens.weight", "lm_head.weight"
+            )
+        self.assertEqual(recorded["embed"], "embed.weight")
+        self.assertEqual(recorded["head"], "head.weight")
+
+    def test_hf_named_checkpoint_is_unaffected(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._checkpoint(root, ["model.embed_tokens.weight", "lm_head.weight"])
+            recorded = self._resolve(
+                root, "model.embed_tokens.weight", "lm_head.weight"
+            )
+        self.assertEqual(recorded["embed"], "model.embed_tokens.weight")
+        self.assertEqual(recorded["head"], "lm_head.weight")
+
+    def test_explicit_override_still_wins(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._checkpoint(root, ["mtp.0.embed.weight", "mtp.2.head.weight"])
+            recorded = self._resolve(
+                root, "mtp.0.embed.weight", "mtp.2.head.weight"
+            )
+        self.assertEqual(recorded["embed"], "mtp.0.embed.weight")
+        self.assertEqual(recorded["head"], "mtp.2.head.weight")
+
+    def test_unresolvable_key_error_lists_what_the_checkpoint_has(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._checkpoint(root, ["embed.weight", "mtp.2.head.weight"])
+            with self.assertRaises(ValueError) as caught:
+                self._resolve(root, "model.embed_tokens.weight", "lm_head.weight")
+        message = str(caught.exception)
+        self.assertIn("lm_head.weight", message)
+        self.assertIn("mtp.2.head.weight", message)
+
+
+class DraftArchitectureValidationTest(unittest.TestCase):
+    """`_load_draft` must accept every architecture an algorithm declares."""
+
+    def _run(self, draft_model, architectures):
+        from types import SimpleNamespace
+
+        from specforge.training import assembly
+
+        spec = SimpleNamespace(
+            architecture=sorted(architectures)[0],
+            compatible_architectures=frozenset(architectures),
+        )
+        provider = SimpleNamespace(
+            draft_config=spec,
+            build_draft=lambda *_args, **_kwargs: draft_model,
+        )
+        algorithm = SimpleNamespace(
+            name="dspark", providers=SimpleNamespace(model=provider)
+        )
+        with mock.patch(
+            "specforge.training.model_loading.resolve_draft_config",
+            return_value=object(),
+        ):
+            return assembly._load_draft(object(), algorithm)
+
+    def test_dspark_declares_both_drafters_as_compatible(self):
+        from specforge.algorithms.dspark.providers import (
+            COMPATIBLE_DRAFT_ARCHITECTURES,
+        )
+
+        self.assertEqual(
+            set(COMPATIBLE_DRAFT_ARCHITECTURES),
+            {"DSparkDraftModel", "DeepseekV4DSparkDraftModel"},
+        )
+
+    def test_accepts_the_non_default_compatible_architecture(self):
+        from specforge.modeling.draft.deepseek_v4_dspark import (
+            DeepseekV4DSparkDraftModel,
+        )
+
+        # DSpark's default architecture is the generic drafter; the V4 one is a
+        # sibling class rather than a subclass, and used to be rejected here.
+        draft = object.__new__(DeepseekV4DSparkDraftModel)
+        _, returned = self._run(
+            draft, {"DSparkDraftModel", "DeepseekV4DSparkDraftModel"}
+        )
+        self.assertIs(returned, draft)
+
+    def test_accepts_the_default_architecture(self):
+        from specforge.modeling.draft.dspark import DSparkDraftModel
+
+        draft = object.__new__(DSparkDraftModel)
+        _, returned = self._run(
+            draft, {"DSparkDraftModel", "DeepseekV4DSparkDraftModel"}
+        )
+        self.assertIs(returned, draft)
+
+    def test_rejects_an_architecture_the_algorithm_does_not_declare(self):
+        with self.assertRaisesRegex(ValueError, "one of"):
+            self._run(
+                torch.nn.Linear(1, 1),
+                {"DSparkDraftModel", "DeepseekV4DSparkDraftModel"},
+            )
+
+    def test_single_architecture_error_names_it_directly(self):
+        with self.assertRaisesRegex(ValueError, "requires DSparkDraftModel,"):
+            self._run(torch.nn.Linear(1, 1), {"DSparkDraftModel"})
+
+
 class _TinyDraft(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -463,3 +697,94 @@ class WarmStartTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TargetHeadOnlyLoadingTest(unittest.TestCase):
+    """A drafter with its own embedding must not pay for the target's.
+
+    On DeepSeek-V4 the target embedding is 129280 x 4096 -- 0.986 GiB of bf16
+    per rank -- and dflash_family_model's noise embedding prefers
+    draft_input_embeddings whenever it exists, so that tensor is never read.
+    head_only skips creating it, rather than allocating and dropping it.
+    """
+
+    def _checkpoint(self, root, keys, hidden=4, vocab=6):
+        from safetensors.torch import save_file
+
+        save_file(
+            {key: torch.zeros(vocab, hidden) for key in keys},
+            os.path.join(root, "model-00001-of-00001.safetensors"),
+        )
+        with open(os.path.join(root, "model.safetensors.index.json"), "w") as out:
+            json.dump(
+                {"weight_map": {k: "model-00001-of-00001.safetensors" for k in keys}},
+                out,
+            )
+        with open(os.path.join(root, "config.json"), "w") as out:
+            json.dump(
+                {
+                    "model_type": "llama",
+                    "hidden_size": hidden,
+                    "vocab_size": vocab,
+                    "tie_word_embeddings": False,
+                },
+                out,
+            )
+
+    def _load(self, root, **kwargs):
+        from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
+
+        return TargetEmbeddingsAndHead.from_pretrained(
+            root,
+            embed_key="model.embed_tokens.weight",
+            lm_head_key="lm_head.weight",
+            device="cpu",
+            dtype=torch.float32,
+            **kwargs,
+        )
+
+    def test_head_only_leaves_no_embedding_allocated(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._checkpoint(root, ["model.embed_tokens.weight", "lm_head.weight"])
+            parts = self._load(root, head_only=True)
+
+        self.assertIsNone(parts.embed_tokens)
+        self.assertIsNotNone(parts.lm_head)
+        # The head still carries real weights -- it is the teacher.
+        self.assertEqual(tuple(parts.lm_head.weight.shape), (6, 4))
+        self.assertNotIn("embed_tokens.weight", dict(parts.named_parameters()))
+
+    def test_default_still_loads_both(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._checkpoint(root, ["model.embed_tokens.weight", "lm_head.weight"])
+            parts = self._load(root)
+
+        self.assertIsNotNone(parts.embed_tokens)
+        self.assertIsNotNone(parts.lm_head)
+
+    def test_head_only_works_without_the_embedding_in_the_checkpoint(self):
+        # Nothing should demand a key the run will never read.
+        with tempfile.TemporaryDirectory() as root:
+            self._checkpoint(root, ["lm_head.weight"])
+            parts = self._load(root, head_only=True)
+        self.assertIsNone(parts.embed_tokens)
+
+    def test_tied_weights_fall_back_to_a_full_load(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._checkpoint(root, ["model.embed_tokens.weight"])
+            with open(os.path.join(root, "config.json"), "w") as out:
+                json.dump(
+                    {
+                        "model_type": "llama",
+                        "hidden_size": 4,
+                        "vocab_size": 6,
+                        "tie_word_embeddings": True,
+                    },
+                    out,
+                )
+            parts = self._load(root, head_only=True)
+
+        # One tensor serving both roles: there is nothing to skip, and
+        # pretending otherwise would drop the head.
+        self.assertIsNotNone(parts.embed_tokens)
+        self.assertIs(parts.lm_head.weight, parts.embed_tokens.weight)

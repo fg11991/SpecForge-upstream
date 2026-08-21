@@ -423,7 +423,11 @@ class FSDPTrainingBackend(TrainingBackend):
             # per rank and inflate the norm by up to sqrt(ep_size) -- 2.83x at
             # EP=8 -- which then clips every step that much harder. Partition
             # instead, which is exact and still one collective.
-            configure(process_group=parallel.draft_ep_group, enabled=True)
+            configure(
+                process_group=parallel.draft_ep_group,
+                enabled=True,
+                partition_replicated=True,
+            )
             return
         configure(process_group=parallel.fsdp_process_group, enabled=False)
 

@@ -643,6 +643,13 @@ class DeepseekV4MoE(nn.Module):
             # from only its local experts. Sum those contributions across EP.
             for parameter in self.gate.parameters():
                 parameter.register_hook(self._reduce_router_gradient)
+            # Everything else in this module is replicated with identical
+            # gradients on every EP rank; only these experts are a disjoint
+            # slice. The optimizer needs the distinction to compute an exact
+            # global gradient norm instead of counting the replicas ep_size
+            # times.
+            for expert_id in range(self.start_expert, self.end_expert):
+                self.experts[expert_id]._specforge_rank_local_parameters = True
 
     def _reduce_router_gradient(self, gradient: torch.Tensor) -> torch.Tensor:
         reduced = gradient.clone()
