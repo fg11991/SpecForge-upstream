@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from array import array
 from typing import List, Optional
 
@@ -33,6 +34,52 @@ from .model_runner import SGLangRunner
 from .utils import wrap_offline_eagle3_logits_processors
 
 logger = logging.getLogger(__name__)
+
+
+
+def _widen_max_total_tokens_for_hybrid_swa(server_args: ServerArgs) -> None:
+    """Size the KV pool by the SWA sub-pool, not by the full pool.
+
+    Offline preparation sizes ``max_total_tokens`` as one batch's worth of
+    tokens, which is right for a uniform KV pool.  A hybrid sliding-window
+    target splits that budget: SGLang gives the SWA sub-pool only
+    ``swa_full_tokens_ratio`` of the full pool, and the allocator's
+    ``available_size()`` is the *minimum* of the two.  DeepSeek-V4 sets that
+    ratio to 0.1 with ``page_size`` 128, so a 2048-token request against a
+    2048-token pool sees a 128-token SWA sub-pool and dies in
+    ``prepare_for_extend`` with "Prefill out of memory" while tens of GB of
+    device memory sit unused.
+
+    Widen the request so the SWA sub-pool alone can hold one batch, rounding up
+    to whole pages.  ``ModelRunner`` still takes ``min(profiled, requested)``,
+    so this only ever raises the ceiling, never the floor: a target whose
+    profile cannot back the wider pool keeps its profiled size.
+    """
+
+    ratio = getattr(server_args, "swa_full_tokens_ratio", None)
+    requested = getattr(server_args, "max_total_tokens", None)
+    if not requested or not ratio or not 0 < ratio < 1:
+        return
+
+    # SGLang sizes the sub-pool as floor(full * ratio / page) * page, so asking
+    # for one extra page of SWA capacity absorbs that truncation: DeepSeek-V4's
+    # full=1198592 yields swa=119808 and full=2048 yields swa=128, both exactly
+    # this formula.
+    page_size = getattr(server_args, "page_size", None) or 1
+    needed = math.ceil((requested + page_size) / ratio)
+    needed = math.ceil(needed / page_size) * page_size
+    if needed <= requested:
+        return
+
+    logger.info(
+        "hybrid sliding-window target: raising max_total_tokens %d -> %d so the "
+        "SWA sub-pool (ratio %.3g, page size %d) can hold one capture batch",
+        requested,
+        needed,
+        ratio,
+        page_size,
+    )
+    server_args.max_total_tokens = needed
 
 
 class OfflineSGLangCaptureBackend:
@@ -62,6 +109,7 @@ class OfflineSGLangCaptureBackend:
             pp_size=1,
             **kwargs,
         )
+        _widen_max_total_tokens_for_hybrid_swa(server_args)
 
         tp_rank = dist.get_rank(get_tp_group())
         moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)

@@ -107,6 +107,23 @@ with a warning.  A target's native `set_dspark_layers_to_capture` remains the
 first choice, and the backend still fails before capture when neither hook is
 available.
 
+DeepSeek-V4 is the one target where neither hook exists.  Stock v0.5.14 wires
+aux capture into `deepseek_v2.py` (V2/V3/V32) but not into `deepseek_v4.py`:
+`DeepseekV4ForCausalLM` already carries `capture_aux_hidden_states` and already
+forwards an aux list, but `DeepseekV4Model` never collects one and no setter is
+defined, so offline DSpark preparation fails in `set_capture_layers()` before
+the first forward.  The server patches above do not fix this — they touch only
+server-side plumbing, and offline preparation does not use them at all.  Apply
+[`patches/sglang/v0.5.14/apply_deepseek_v4_capture.py`](../../patches/sglang/v0.5.14/apply_deepseek_v4_capture.py)
+to the installed SGLang tree instead; it is anchored, idempotent, and
+reversible, and its module docstring records the three V4-specific hazards
+(deferred fused-mHC `hc_post`, mHC stream folding, and the
+`hidden_states_before_norm` preference in `_get_hidden_states_to_store` that
+would otherwise overwrite the aux concatenation).  The mHC fold it applies
+matches SpecForge's normalizer but is not verified against the official V4
+DSpark drafter; see the checklist in
+`my_docs/2026-08-12_DeepSeekV4_DSpark_MoE_昇腾训练适配开发文档.md`.
+
 `tests/test_runtime/test_sglang_0514_compat.py` guards the patched 0.5.14 API
 seams, and
 `tests/test_offline_capture/test_sglang_backend.py`

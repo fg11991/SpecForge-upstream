@@ -115,6 +115,59 @@ class TestOfflineSGLangCaptureHooks(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "set_dspark_layers_to_capture"):
             backend.set_capture_layers([1], capture_method="dspark")
 
+    def _server_args(self, **fields):
+        defaults = {"max_total_tokens": None, "swa_full_tokens_ratio": None, "page_size": 1}
+        defaults.update(fields)
+        return types.SimpleNamespace(**defaults)
+
+    def _widen(self, server_args):
+        self.capture_module._widen_max_total_tokens_for_hybrid_swa(server_args)
+        return server_args.max_total_tokens
+
+    def _swa_pool(self, full, ratio, page):
+        """Reproduce SGLang's sub-pool sizing: floor(full * ratio / page) * page."""
+        return (int(full * ratio) // page) * page
+
+    def test_uniform_kv_pool_is_left_alone(self):
+        args = self._server_args(max_total_tokens=2048)
+        self.assertEqual(self._widen(args), 2048)
+
+    def test_hybrid_swa_pool_can_hold_one_batch(self):
+        # The DeepSeek-V4 configuration that failed in prepare_for_extend:
+        # max_total_tokens=2048 gave a 128-token SWA sub-pool.
+        ratio, page, batch_tokens = 0.1, 128, 2048
+        self.assertEqual(self._swa_pool(batch_tokens, ratio, page), 128)
+
+        args = self._server_args(
+            max_total_tokens=batch_tokens,
+            swa_full_tokens_ratio=ratio,
+            page_size=page,
+        )
+        widened = self._widen(args)
+        self.assertGreater(widened, batch_tokens)
+        self.assertEqual(widened % page, 0)
+        self.assertGreaterEqual(self._swa_pool(widened, ratio, page), batch_tokens)
+
+    def test_hybrid_swa_widening_holds_across_batch_sizes(self):
+        ratio, page = 0.1, 128
+        for batch_tokens in (512, 2048, 4096, 8192, 4096 * 8):
+            args = self._server_args(
+                max_total_tokens=batch_tokens,
+                swa_full_tokens_ratio=ratio,
+                page_size=page,
+            )
+            widened = self._widen(args)
+            self.assertGreaterEqual(
+                self._swa_pool(widened, ratio, page),
+                batch_tokens,
+                f"SWA sub-pool too small for {batch_tokens} tokens",
+            )
+
+    def test_degenerate_ratios_are_ignored(self):
+        for ratio in (None, 0, 1, 1.5):
+            args = self._server_args(max_total_tokens=2048, swa_full_tokens_ratio=ratio)
+            self.assertEqual(self._widen(args), 2048, f"ratio={ratio}")
+
     def test_offline_cache_honors_disable_radix_cache(self):
         captured = {}
 

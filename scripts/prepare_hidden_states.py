@@ -222,7 +222,28 @@ def parse_args():
         help="Attention backend used by the offline SGLang capture",
     )
     sglang_group.add_argument("--sglang-mem-fraction-static", type=float, default=0.4)
+    sglang_group.add_argument(
+        "--sglang-max-total-tokens",
+        type=int,
+        default=None,
+        help=(
+            "KV pool ceiling in tokens (default: one capture batch). Hybrid "
+            "sliding-window targets have this raised automatically so the SWA "
+            "sub-pool alone can hold a batch. SGLang caps the pool at the "
+            "profiled capacity either way."
+        ),
+    )
     sglang_group.add_argument("--sglang-context-length", type=int, default=None)
+    sglang_group.add_argument(
+        "--sglang-quantization",
+        default=None,
+        help=(
+            "SGLang quantization method for the capture target (e.g. "
+            "'modelslim' for Ascend W8A8 checkpoints, 'compressed-tensors'). "
+            "Required when the checkpoint carries no quantization_config and "
+            "SGLang would otherwise have to guess the compute path."
+        ),
+    )
     sglang_group.add_argument("--sglang-enable-nccl-nvls", action="store_true")
     sglang_group.add_argument("--sglang-enable-symm-mem", action="store_true")
     sglang_group.add_argument("--sglang-enable-torch-compile", action="store_true")
@@ -513,6 +534,7 @@ def _sglang_kwargs(args: argparse.Namespace) -> Dict[str, object]:
         "attention_backend": args.sglang_attention_backend,
         "mem_fraction_static": args.sglang_mem_fraction_static,
         "context_length": args.sglang_context_length,
+        "quantization": getattr(args, "sglang_quantization", None),
         "enable_nccl_nvls": args.sglang_enable_nccl_nvls,
         "enable_symm_mem": args.sglang_enable_symm_mem,
         "enable_torch_compile": args.sglang_enable_torch_compile,
@@ -521,7 +543,10 @@ def _sglang_kwargs(args: argparse.Namespace) -> Dict[str, object]:
         "ep_size": args.sglang_ep_size,
         "disable_radix_cache": getattr(args, "sglang_disable_radix_cache", False),
         "max_running_requests": args.batch_size,
-        "max_total_tokens": args.batch_size * args.max_length,
+        "max_total_tokens": (
+            getattr(args, "sglang_max_total_tokens", None)
+            or args.batch_size * args.max_length
+        ),
     }
 
 
