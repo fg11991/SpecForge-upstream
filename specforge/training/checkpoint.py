@@ -32,6 +32,87 @@ logger = logging.getLogger(__name__)
 STATE_FILE = "training_state.pt"
 
 
+def consolidate_draft_state(
+    checkpoint_dir: str,
+    shared_state: Dict[str, Any],
+    *,
+    map_location="cpu",
+) -> Dict[str, Any]:
+    """Merge draft tensors saved by all expert-parallel group leaders.
+
+    A normal DP/FSDP checkpoint is already complete in ``training_state.pt``.
+    Under DSpark EP, each draft-DP group leader materializes only its local
+    routed experts, so export and warm-start must union the rank-local payloads.
+    Replicated tensors occur in several files and are intentionally accepted;
+    topology/resume contracts guarantee that those replicas were synchronized.
+    """
+
+    merged: Dict[str, Any] = {}
+    shared_draft = shared_state.get("draft_state_dict")
+    if isinstance(shared_draft, dict):
+        merged.update(shared_draft)
+    rank_pattern = os.path.join(checkpoint_dir, "training_state_rank*.pt")
+    for rank_path in sorted(glob.glob(rank_pattern)):
+        rank_state = torch.load(
+            rank_path, map_location=map_location, weights_only=False
+        )
+        rank_draft = rank_state.get("draft_state_dict")
+        if not isinstance(rank_draft, dict):
+            continue
+        for name, tensor in rank_draft.items():
+            existing = merged.get(name)
+            if existing is not None and (
+                getattr(existing, "shape", None) != getattr(tensor, "shape", None)
+                or getattr(existing, "dtype", None) != getattr(tensor, "dtype", None)
+            ):
+                raise ValueError(
+                    f"conflicting expert-parallel checkpoint tensor {name!r}: "
+                    f"{getattr(existing, 'shape', None)}/"
+                    f"{getattr(existing, 'dtype', None)} vs "
+                    f"{getattr(tensor, 'shape', None)}/"
+                    f"{getattr(tensor, 'dtype', None)}"
+                )
+            merged.setdefault(name, tensor)
+    if not merged:
+        raise ValueError(
+            f"checkpoint {checkpoint_dir} contains no draft_state_dict tensors"
+        )
+    expected_experts = shared_state.get("n_routed_experts")
+    expected_layers = shared_state.get("dspark_num_layers")
+    if expected_experts is not None and expected_layers is not None:
+        identities = set()
+        expert_parameters: Dict[tuple[int, int], set[str]] = {}
+        pattern = re.compile(
+            r"(?:^|\.)mtp\.(\d+)\.ffn\.experts\.(\d+)\.(w[123]\.weight)$"
+        )
+        for name in merged:
+            match = pattern.search(name)
+            if match is None:
+                continue
+            identity = (int(match.group(1)), int(match.group(2)))
+            identities.add(identity)
+            expert_parameters.setdefault(identity, set()).add(match.group(3))
+        expected_identities = {
+            (layer, expert)
+            for layer in range(int(expected_layers))
+            for expert in range(int(expected_experts))
+        }
+        missing_identities = expected_identities - identities
+        incomplete = {
+            identity: sorted({"w1.weight", "w2.weight", "w3.weight"} - keys)
+            for identity, keys in expert_parameters.items()
+            if keys != {"w1.weight", "w2.weight", "w3.weight"}
+        }
+        if missing_identities or incomplete:
+            raise ValueError(
+                "incomplete expert-parallel checkpoint: expected "
+                f"{len(expected_identities)} layer/expert shards, found "
+                f"{len(identities)}; missing={sorted(missing_identities)[:12]}, "
+                f"incomplete={dict(list(sorted(incomplete.items()))[:12])}"
+            )
+    return merged
+
+
 class CheckpointManager:
     def __init__(
         self,
@@ -294,6 +375,7 @@ class CheckpointManager:
         if local_error is not None:
             raise local_error
         assert state is not None
+        state["_checkpoint_dir"] = path
 
         rank = torch.distributed.get_rank() if initialized else 0
         saved_world = state.get("world_size")

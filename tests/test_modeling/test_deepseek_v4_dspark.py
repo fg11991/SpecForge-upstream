@@ -489,6 +489,75 @@ class TestDeepseekV4DSparkArchitecture(unittest.TestCase):
                 join=True,
             )
 
+    @unittest.skipUnless(dist.is_available(), "torch.distributed is unavailable")
+    def test_backend_wrap_runs_two_steps_with_uniform_parameter_dtype(self):
+        if dist.is_initialized():
+            self.skipTest("requires ownership of the singleton process group")
+        with tempfile.TemporaryDirectory() as directory:
+            init_file = os.path.join(directory, "gloo-init")
+            dist.init_process_group(
+                "gloo", init_method=f"file://{init_file}", rank=0, world_size=1
+            )
+            try:
+                for sharding in ("SHARD_GRAD_OP", "NO_SHARD"):
+                    torch.manual_seed(31)
+                    model = DeepseekV4DSparkDraftModel(tiny_config()).to(
+                        dtype=torch.bfloat16
+                    )
+                    backend = FSDPTrainingBackend(
+                        ParallelConfig(
+                            world_size=1,
+                            sharding_strategy=sharding,
+                            param_dtype=torch.bfloat16,
+                            fsdp_process_group=dist.group.WORLD,
+                        ),
+                        optimizer_factory=lambda module: torch.optim.SGD(
+                            module.parameters(), lr=1e-3
+                        ),
+                    )
+                    wrapped = backend.prepare_model(
+                        model, optimizer_target=model
+                    )
+                    self.assertEqual(
+                        {parameter.dtype for parameter in model.parameters()},
+                        {torch.bfloat16},
+                    )
+                    for _ in range(2):
+                        output = wrapped(
+                            position_ids=torch.arange(15).view(1, -1),
+                            attention_mask=torch.ones(
+                                1, 1, 5, 15, dtype=torch.bool
+                            ),
+                            noise_embedding=torch.randn(
+                                1, 5, 16, dtype=torch.bfloat16
+                            ),
+                            target_hidden=torch.randn(
+                                1, 10, 48, dtype=torch.bfloat16
+                            ),
+                        )
+                        hidden = model.prepare_objective_hidden(output)
+                        previous = torch.zeros(1, 5, dtype=torch.long)
+                        logits = model.apply_logits_head(
+                            torch.zeros(1, 5, model.config.vocab_size),
+                            prev_token_ids=previous,
+                            hidden_states=hidden,
+                        )
+                        confidence = model.predict_confidence(
+                            output.view(1, 1, 5, -1),
+                            prev_token_ids=previous.view(1, 1, 5),
+                        )
+                        loss = (
+                            hidden.float().square().mean()
+                            + logits.float().square().mean()
+                            + confidence.float().square().mean()
+                        )
+                        backend.backward(loss)
+                        backend.step()
+                        backend.optimizer.zero_grad(set_to_none=True)
+            finally:
+                dist.destroy_process_group()
+
+
 class TestDeepseekV4ConfigContract(unittest.TestCase):
     """Guards on what must exist before PretrainedConfig.__init__ runs.
 

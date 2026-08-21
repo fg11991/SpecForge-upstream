@@ -18,9 +18,12 @@ ref source + store the Trainer is handed — the loader IS the stream.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from contextlib import nullcontext
 from typing import Callable, Mapping, Optional
+
+import torch
 
 from specforge.algorithms.common.providers import (
     MODEL_PROVENANCE_CONTRACT_KEY,
@@ -107,6 +110,7 @@ class Trainer:
         checkpoint_extra: Optional[dict] = None,
         max_checkpoints: int = 0,
         tp_size: int = 1,
+        expert_parallel_size: int = 1,
         sp_ulysses_size: int = 1,
         sp_ring_size: int = 1,
         dataloader_num_workers: int = 0,
@@ -251,9 +255,16 @@ class Trainer:
             "num_epochs": num_epochs,
             "effective_total_steps": effective_total_steps,
             "tp_size": tp_size,
+            "expert_parallel_size": expert_parallel_size,
             "sp_ulysses_size": sp_ulysses_size,
             "sp_ring_size": sp_ring_size,
         }
+        draft_config = getattr(model.draft_model, "config", None)
+        if expert_parallel_size > 1:
+            standard_checkpoint_extra.update(
+                n_routed_experts=int(draft_config.n_routed_experts),
+                dspark_num_layers=int(draft_config.dspark_num_layers),
+            )
         explicit_checkpoint_extra = dict(checkpoint_extra or {})
         duplicate_algorithm_keys = (
             algorithm_checkpoint_extra.keys() & explicit_checkpoint_extra.keys()
@@ -340,6 +351,39 @@ class Trainer:
                         f"resume with the original configuration"
                     )
             saved_weights = state["draft_state_dict"]
+            local_weights = None
+            # FSDP gathers one full state on the leader of each draft-DP
+            # process group.  With EP/SP, global rank0 owns only one expert
+            # shard; peers load the leader that shares their (ep, sp)
+            # coordinate instead of accidentally restoring rank0's experts.
+            if expert_parallel_size > 1:
+                local_weights = state["backend"].get("draft_state_dict")
+            if local_weights is None and expert_parallel_size > 1:
+                mp_size = (
+                    expert_parallel_size * sp_ulysses_size * sp_ring_size
+                )
+                leader_rank = (
+                    dist.get_rank() % mp_size if dist.is_initialized() else 0
+                )
+                leader_path = os.path.join(
+                    state["_checkpoint_dir"],
+                    f"training_state_rank{leader_rank}.pt",
+                )
+                if os.path.isfile(leader_path):
+                    leader_state = torch.load(
+                        leader_path, map_location="cpu", weights_only=False
+                    )
+                    local_weights = leader_state.get("draft_state_dict")
+            if expert_parallel_size > 1:
+                if not isinstance(saved_weights, dict):
+                    saved_weights = {}
+                if isinstance(local_weights, dict):
+                    saved_weights = {**saved_weights, **local_weights}
+            if saved_weights is None:
+                raise ValueError(
+                    "expert-parallel checkpoint contains no draft weights for "
+                    "this rank's expert coordinate"
+                )
             load_result = model.draft_model.load_state_dict(saved_weights, strict=False)
             loaded = len(saved_weights) - len(load_result.unexpected_keys)
             missing_keys = set(load_result.missing_keys)
@@ -415,6 +459,7 @@ class Trainer:
 
         parallel = ParallelConfig.from_distributed(
             tp_size=tp_size,
+            expert_parallel_size=expert_parallel_size,
             sp_ulysses_size=sp_ulysses_size,
             sp_ring_size=sp_ring_size,
         )
