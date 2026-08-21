@@ -254,6 +254,20 @@ class FSDPTrainingBackend(TrainingBackend):
 
         Replicated ``NO_SHARD`` recipes use DDP; sharded recipes use FSDP.
         """
+        if wrap and self._single_rank_group():
+            # A one-rank process group has nothing to shard and nothing to
+            # reduce across, and MixedPrecision casts a bf16 model to bf16, so
+            # the wrapper buys no function at all here. It still builds
+            # FlatParameters and hands out p.grad as a view into a flat
+            # gradient buffer, and on Ascend that produced gradients read as
+            # inf or NaN from a forward that was bit-identical to a healthy
+            # run. Expert parallelism is the only configuration that gets a
+            # one-rank draft-DP group -- every other recipe wraps the eight-rank
+            # WORLD group and never reaches this state.
+            logging.getLogger(__name__).info(
+                "draft-DP group has one rank; running the draft model unwrapped"
+            )
+            wrap = False
         if not wrap:
             self.module = model
             self._wrapped = False
@@ -345,6 +359,15 @@ class FSDPTrainingBackend(TrainingBackend):
             self.optimizer = self._optimizer_factory(target)
             self._configure_optimizer_grad_norm()
         return self.module
+
+    def _single_rank_group(self) -> bool:
+        """Whether the wrapping process group holds exactly one rank."""
+        if not (dist.is_available() and dist.is_initialized()):
+            return False
+        try:
+            return dist.get_world_size(self.parallel_config.fsdp_process_group) == 1
+        except Exception:
+            return False
 
     def set_optimizer(self, optimizer) -> None:
         self.optimizer = optimizer

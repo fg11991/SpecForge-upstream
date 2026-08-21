@@ -751,3 +751,43 @@ class TestDeepseekV4OfficialLoading(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+
+
+class FsdpWrapGranularityTest(unittest.TestCase):
+    """The drafter must be one FSDP unit, not one unit per block.
+
+    Its forward reaches into block submodules from outside those blocks'
+    forward, so a per-block auto-wrap policy leaves those parameters sharded at
+    the moment they are used. On Ascend that surfaces as a zero-element weight
+    and a 631 GiB allocation request from the matmul kernel.
+    """
+
+    def test_model_does_not_advertise_block_classes(self):
+        model = DeepseekV4DSparkDraftModel(tiny_config())
+        self.assertFalse(getattr(model, "_no_split_modules", None))
+
+    def test_backend_derives_no_auto_wrap_policy(self):
+        from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
+
+        model = DeepseekV4DSparkDraftModel(tiny_config())
+        backend = FSDPTrainingBackend(ParallelConfig(sharding_strategy="NO_SHARD"))
+        backend.prepare_model(model, wrap=False, optimizer_target=model)
+        # wrap=False keeps this a pure contract check on what the policy would
+        # have been built from.
+        block_names = set(getattr(model, "_no_split_modules", None) or ())
+        self.assertEqual(block_names, set())
+
+    def test_every_module_level_reach_in_still_resolves(self):
+        # These are the accesses that a per-block unit would break; keep them
+        # enumerated so a future refactor that moves one cannot go unnoticed.
+        model = DeepseekV4DSparkDraftModel(tiny_config())
+        self.assertIsNotNone(model.mtp[0].main_proj)
+        self.assertIsNotNone(model.mtp[0].main_norm)
+        self.assertIsNotNone(model.mtp[-1].norm)
+        self.assertIsNotNone(model.mtp[-1].hc_head_fn)
+        self.assertIsNotNone(model.markov_head)
+        self.assertIsNotNone(model.confidence_head)
+        self.assertIs(model.draft_input_embeddings, model.mtp[0].embed)
+        self.assertIs(model.draft_output_head, model.mtp[-1].head)
