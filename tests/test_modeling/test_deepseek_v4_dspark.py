@@ -181,6 +181,62 @@ class TestDeepseekV4DSparkArchitecture(unittest.TestCase):
                     f"mtp.{stage}.ffn.experts.{expert}.w1.weight", keys
                 )
 
+    def test_draft_owns_its_embedding_and_head_frozen(self):
+        model = DeepseekV4DSparkDraftModel(tiny_config())
+        keys = set(model.state_dict())
+        # The official checkpoint publishes these; owning them is what makes
+        # warm start land in the drafter's own input/output space.
+        self.assertIn("mtp.0.embed.weight", keys)
+        self.assertIn("mtp.2.head.weight", keys)
+        self.assertIs(model.draft_input_embeddings, model.mtp[0].embed)
+        self.assertIs(model.draft_output_head, model.mtp[-1].head)
+        # Loaded, not trained: they carry the released drafter's spaces and
+        # would otherwise add optimizer state for 2 * vocab * hidden values.
+        self.assertFalse(model.mtp[0].embed.weight.requires_grad)
+        self.assertFalse(model.mtp[-1].head.weight.requires_grad)
+
+    def test_objective_and_teacher_use_different_heads(self):
+        from specforge.algorithms.common.dflash_family_model import OnlineDSparkModel
+
+        hidden_size, vocab = 4, 6
+        target_head = nn.Linear(hidden_size, vocab, bias=False)
+        draft_head = nn.Linear(hidden_size, vocab, bias=False)
+        with torch.no_grad():
+            target_head.weight.fill_(1.0)
+            draft_head.weight.fill_(2.0)
+
+        model = object.__new__(OnlineDSparkModel)
+        nn.Module.__init__(model)
+        # spec=[] so the optional prepare_objective_hidden hook resolves to None.
+        model.draft_model = mock.Mock(spec=[])
+        model.lm_head = target_head
+        model.draft_lm_head = draft_head
+        model.use_draft_vocab = False
+
+        hidden = torch.ones(1, hidden_size)
+        assert_close(model.apply_objective_head(hidden), draft_head(hidden))
+        assert_close(model.apply_teacher_head(hidden), target_head(hidden))
+        self.assertFalse(
+            torch.equal(
+                model.apply_objective_head(hidden), model.apply_teacher_head(hidden)
+            )
+        )
+
+    def test_objective_falls_back_to_the_target_head_without_a_draft_head(self):
+        from specforge.algorithms.common.dflash_family_model import OnlineDSparkModel
+
+        target_head = nn.Linear(3, 5, bias=False)
+        model = object.__new__(OnlineDSparkModel)
+        nn.Module.__init__(model)
+        # spec=[] so the optional prepare_objective_hidden hook resolves to None.
+        model.draft_model = mock.Mock(spec=[])
+        model.lm_head = target_head
+        model.draft_lm_head = None
+        model.use_draft_vocab = False
+
+        hidden = torch.randn(2, 3)
+        assert_close(model.apply_objective_head(hidden), target_head(hidden))
+
     def test_sqrtsoftplus_router_backward_survives_underflowed_logits(self):
         """softplus underflows to zero long before the router runs out of experts."""
 

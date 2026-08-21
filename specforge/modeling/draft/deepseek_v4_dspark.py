@@ -759,6 +759,12 @@ class DeepseekV4DSparkBlock(nn.Module):
         )
         self.hc_ffn_scale = nn.Parameter(torch.ones(3, dtype=torch.float32))
         if stage == 0:
+            # The official DSpark module carries its own token embedding, which
+            # is NOT the target's: on the released Flash checkpoint the two
+            # differ by up to 3.7. Owning it here is what lets warm start put
+            # the drafter back in the space it was trained in.
+            self.embed = nn.Embedding(config.vocab_size, config.hidden_size)
+            self.embed.weight.requires_grad_(False)
             self.main_proj = nn.Linear(
                 config.hidden_size * len(config.dspark_target_layer_ids),
                 config.hidden_size,
@@ -768,6 +774,14 @@ class DeepseekV4DSparkBlock(nn.Module):
                 config.hidden_size, config.rms_norm_eps
             )
         if stage == config.dspark_num_layers - 1:
+            # Likewise the drafter's own output head, which differs from the
+            # target's by up to 4.4. Scoring draft hidden states with the
+            # target head is what made a warm-started drafter behave like a
+            # randomly initialized one.
+            self.head = nn.Linear(
+                config.hidden_size, config.vocab_size, bias=False
+            )
+            self.head.weight.requires_grad_(False)
             self.norm = DeepseekV4RMSNorm(config.hidden_size, config.rms_norm_eps)
             self.hc_head_fn = nn.Parameter(
                 torch.empty(self.hc_mult, hc_width, dtype=torch.float32)
@@ -1070,6 +1084,18 @@ class DeepseekV4DSparkDraftModel(DraftVocabMappingMixin, PreTrainedModel):
                 nn.init.normal_(module.hc_head_fn, mean=0.0, std=std)
                 nn.init.zeros_(module.hc_head_base)
                 nn.init.ones_(module.hc_head_scale)
+
+    @property
+    def draft_input_embeddings(self) -> nn.Module:
+        """The drafter's own token embedding, distinct from the target's."""
+
+        return self.mtp[0].embed
+
+    @property
+    def draft_output_head(self) -> nn.Module:
+        """The drafter's own output head, distinct from the target's."""
+
+        return self.mtp[-1].head
 
     def _project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         if target_hidden.ndim == 5:

@@ -201,10 +201,20 @@ class OnlineDFlashModel(nn.Module):
         self.draft_model = draft_model
         self.lm_head = target_lm_head
         self.embed_tokens = target_embed_tokens
+        # A drafter published with its own token embedding and output head --
+        # DeepSeek-V4 DSpark is one -- was trained to read and write in those
+        # spaces, not the target's. Score its hidden states with the target head
+        # and a warm-started drafter behaves like a random one. The teacher
+        # distribution still comes from the target head below; only the draft
+        # side moves.
+        self.draft_lm_head = getattr(draft_model, "draft_output_head", None)
+        self.draft_embed_tokens = getattr(draft_model, "draft_input_embeddings", None)
         self.use_draft_vocab = bool(getattr(draft_model, "use_draft_vocab", False))
-        # (version, pruned_head_weight, target->draft label index); see
+        # (cache key, pruned_head_weight, target->draft label index); see
         # _pruned_head_state for why this cannot be built in __init__.
-        self._pruned_head_cache: Optional[Tuple[int, torch.Tensor, torch.Tensor]] = None
+        self._pruned_head_cache: Optional[
+            Tuple[Tuple[int, int], torch.Tensor, torch.Tensor]
+        ] = None
         self.block_size = block_size
         self.mask_token_id = mask_token_id
         self.attention_backend = attention_backend
@@ -218,7 +228,7 @@ class OnlineDFlashModel(nn.Module):
         self._cached_seq_len: Optional[int] = None
         self._cached_bsz: Optional[int] = None
 
-    def _pruned_head_state(self) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _pruned_head_state(self, weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return ``(head_weight[K, H], label_index[V])`` for the pruned vocab.
 
         Built on first use rather than in ``__init__``: the training model is
@@ -230,17 +240,19 @@ class OnlineDFlashModel(nn.Module):
         """
         draft = self.draft_model
         version = int(getattr(draft, "vocab_mapping_version", 0))
+        # Draft and teacher can now be different heads, so the cache is keyed by
+        # which one it holds as well as by the mapping version.
+        key = (version, id(weight))
         cache = self._pruned_head_cache
-        if cache is not None and cache[0] == version:
+        if cache is not None and cache[0] == key:
             return cache[1], cache[2]
         draft.require_vocab_mapping()
-        weight = self.lm_head.weight
         mask = draft.t2d.to(device=weight.device, dtype=torch.bool)
         # Row-slicing keeps the same order as column-slicing the full logits, so
         # draft index i corresponds to target id nonzero(t2d)[i] on both sides.
         pruned_weight = weight[mask].contiguous()
         label_index = draft.draft_vocab_index().to(device=weight.device)
-        self._pruned_head_cache = (version, pruned_weight, label_index)
+        self._pruned_head_cache = (key, pruned_weight, label_index)
         return pruned_weight, label_index
 
     def apply_objective_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -249,9 +261,23 @@ class OnlineDFlashModel(nn.Module):
         Unpruned runs call the head module itself, which keeps any head that is
         not a plain ``nn.Linear`` working. Only pruning needs the raw rows.
         """
+        prepare_hidden = getattr(
+            self.draft_model, "prepare_objective_hidden", None
+        )
+        if prepare_hidden is not None:
+            hidden_states = prepare_hidden(hidden_states)
+        head = self.draft_lm_head if self.draft_lm_head is not None else self.lm_head
+        if not self.use_draft_vocab:
+            return head(hidden_states)
+        weight = self._pruned_head_state(head.weight)[0]
+        return F.linear(hidden_states.to(weight.dtype), weight)
+
+    def apply_teacher_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply target head rows without draft-specific output normalization."""
+
         if not self.use_draft_vocab:
             return self.lm_head(hidden_states)
-        weight = self._pruned_head_state()[0]
+        weight = self._pruned_head_state(self.lm_head.weight)[0]
         return F.linear(hidden_states.to(weight.dtype), weight)
 
     def _full_vocab_logsumexp(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -314,7 +340,8 @@ class OnlineDFlashModel(nn.Module):
         bsz, n_blocks = anchor_positions.shape
         device = anchor_positions.device
         offsets = torch.arange(self.block_size, device=device).view(1, 1, -1)
-        pos_ids = anchor_positions.unsqueeze(-1) + offsets
+        offset = int(getattr(self.draft_model, "draft_position_offset", 0))
+        pos_ids = anchor_positions.unsqueeze(-1) + offsets + offset
         return pos_ids.view(bsz, -1)
 
     def _create_noise_embed(self, input_ids, anchor_positions, block_keep_mask):
@@ -340,7 +367,12 @@ class OnlineDFlashModel(nn.Module):
             torch.tensor(self.mask_token_id, dtype=torch.long, device=device),
         )
 
-        return self.embed_tokens(noise_ids)
+        embed = (
+            self.draft_embed_tokens
+            if self.draft_embed_tokens is not None
+            else self.embed_tokens
+        )
+        return embed(noise_ids)
 
     def _dpace_weight(
         self,
@@ -409,6 +441,12 @@ class OnlineDFlashModel(nn.Module):
             "block_size": self.block_size,
             "device": device,
         }
+        if bool(getattr(self.draft_model, "include_anchor_context", False)):
+            mask_args.update(
+                include_anchor_context=True,
+                parallel_draft_visibility=True,
+                sliding_window=int(self.draft_model.fixed_context_window),
+            )
         if (
             self.attention_backend == "flex_attention"
             and flex_attention_backend() == "FLASH"
@@ -990,7 +1028,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 # what turns the pruned objective into a match against the target
                 # distribution renormalized over the kept tokens, rather than a
                 # match against a truncated (sub-normalized) one.
-                target_logits = self.apply_objective_head(flat_teacher).reshape_as(
+                target_logits = self.apply_teacher_head(flat_teacher).reshape_as(
                     draft_logits
                 )
                 # Distillation target: renormalized over the kept tokens. The
@@ -1140,7 +1178,14 @@ class OnlineDSparkModel(OnlineDFlashModel):
         ce_weights = loss_weights
         local_ce_den = local_loss_den
         if self.use_draft_vocab:
-            label_index = self._pruned_head_state()[1]
+            # The label index depends only on the vocab mapping, but the cache
+            # is per head; ask the one the objective scores with.
+            objective_head = (
+                self.draft_lm_head
+                if self.draft_lm_head is not None
+                else self.lm_head
+            )
+            label_index = self._pruned_head_state(objective_head.weight)[1]
             objective_target_ids = label_index[target_ids]
             ce_weights = loss_weights * (objective_target_ids >= 0).to(
                 loss_weights.dtype
@@ -1195,14 +1240,23 @@ class OnlineDSparkModel(OnlineDFlashModel):
         ) = totals
 
         global_loss_den = local_loss_den.detach().clone()
-        world_size = 1
+        data_parallel_size = 1
         import torch.distributed as dist
 
         distributed = dist.is_available() and dist.is_initialized()
+        data_group = None
         if distributed:
-            world_size = dist.get_world_size()
-            if world_size > 1:
-                dist.all_reduce(global_loss_den, op=dist.ReduceOp.SUM)
+            try:
+                from specforge.distributed import get_draft_dp_group
+
+                data_group = get_draft_dp_group()
+            except (ImportError, AttributeError):
+                data_group = None
+            data_parallel_size = dist.get_world_size(group=data_group)
+            if data_parallel_size > 1:
+                dist.all_reduce(
+                    global_loss_den, op=dist.ReduceOp.SUM, group=data_group
+                )
         if float(global_loss_den) <= 0:
             raise ValueError("DSpark objective has no supervised target tokens")
 
@@ -1215,8 +1269,8 @@ class OnlineDSparkModel(OnlineDFlashModel):
         global_ce_den = global_loss_den
         if self.use_draft_vocab:
             global_ce_den = local_ce_den.detach().clone()
-            if world_size > 1:
-                dist.all_reduce(global_ce_den, op=dist.ReduceOp.SUM)
+            if data_parallel_size > 1:
+                dist.all_reduce(global_ce_den, op=dist.ReduceOp.SUM, group=data_group)
             if self.dspark_ce_loss_alpha > 0 and float(global_ce_den) <= 0:
                 raise ValueError(
                     "DSpark cross-entropy has no in-vocabulary target tokens; "
@@ -1230,7 +1284,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             # original expression means an existing run's loss curve does not
             # move by a few ulps for a feature it does not use.
             loss = (
-                world_size
+                data_parallel_size
                 * (
                     self.dspark_ce_loss_alpha * ce_num
                     + self.dspark_l1_loss_alpha * l1_num
@@ -1247,7 +1301,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 if self.dspark_ce_loss_alpha > 0
                 else ce_num * 0.0
             )
-            loss = world_size * (
+            loss = data_parallel_size * (
                 ce_term
                 + (
                     self.dspark_l1_loss_alpha * l1_num
