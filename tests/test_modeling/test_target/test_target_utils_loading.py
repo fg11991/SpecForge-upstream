@@ -247,6 +247,59 @@ class TargetEmbeddingsAndHeadLoadingTest(unittest.TestCase):
         self.assertEqual(module.lm_head_mup_folded, 4.0)
         self.assertFalse(module.lm_head.weight.requires_grad)
 
+    def test_remote_load_downloads_only_required_weight_shards(self):
+        config = SimpleNamespace(
+            vocab_size=4,
+            hidden_size=3,
+            pad_token_id=None,
+            tie_word_embeddings=False,
+        )
+        weight_map = {
+            self.embed_key: "embed.safetensors",
+            self.head_key: "head.safetensors",
+            "model.layers.0.weight": "backbone.safetensors",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            index = Path(tmp, "model.safetensors.index.json")
+            index.write_text(json.dumps({"weight_map": weight_map}))
+            captured = {}
+
+            def snapshot(**kwargs):
+                captured.update(kwargs)
+                return tmp
+
+            def load_weights(instance, *_args, **_kwargs):
+                instance.embed_tokens.weight.data.zero_()
+                instance.lm_head.weight.data.zero_()
+                return {self.embed_key, self.head_key}
+
+            with (
+                patch(
+                    "specforge.modeling.target.target_utils.load_target_config",
+                    return_value=config,
+                ),
+                patch(
+                    "specforge.modeling.target.target_utils.hf_hub_download",
+                    return_value=str(index),
+                ),
+                patch(
+                    "specforge.modeling.target.target_utils.snapshot_download",
+                    side_effect=snapshot,
+                ),
+                patch.object(TargetEmbeddingsAndHead, "_load_weights", load_weights),
+            ):
+                TargetEmbeddingsAndHead.from_pretrained(
+                    "org/remote-model",
+                    embed_key=self.embed_key,
+                    lm_head_key=self.head_key,
+                    device="cpu",
+                    dtype=torch.float32,
+                )
+
+        self.assertIn("embed.safetensors", captured["allow_patterns"])
+        self.assertIn("head.safetensors", captured["allow_patterns"])
+        self.assertNotIn("backbone.safetensors", captured["allow_patterns"])
+
 
 if __name__ == "__main__":
     unittest.main()
