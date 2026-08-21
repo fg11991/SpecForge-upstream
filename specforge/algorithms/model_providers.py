@@ -160,17 +160,48 @@ def _finish_registered_draft(
     draft_config: PretrainedConfig,
     draft_model: Any,
 ):
-    _warm_start(cfg, draft_model, draft_config)
-    # Same order as EAGLE3: warm-started buffers are then overwritten by the
-    # run's own mapping, so an explicit path always wins over the checkpoint's.
-    _load_vocab_mapping(cfg, draft_model)
+    load_official = getattr(draft_model, "load_official_checkpoint", None)
+    official_fused = False
+    if load_official is not None and cfg.model.draft_checkpoint_path:
+        from specforge.training.model_loading import is_specforge_checkpoint
+
+        official_fused = not is_specforge_checkpoint(
+            cfg.model.draft_checkpoint_path
+        )
+    if official_fused:
+        # A pruned Markov output needs the target-id rows while the official
+        # fused checkpoint is being dequantized, so install the mapping first.
+        _load_vocab_mapping(cfg, draft_model)
+        load_official(cfg.model.draft_checkpoint_path)
+    else:
+        _warm_start(cfg, draft_model, draft_config)
+        # Same order as EAGLE3: warm-started buffers are then overwritten by the
+        # run's own mapping, so an explicit path always wins over the checkpoint.
+        _load_vocab_mapping(cfg, draft_model)
     return draft_model.to(device=_device(), dtype=_torch_dtype(cfg))
 
 
 def build_registered_draft(cfg: Config, draft_config: PretrainedConfig):
     from specforge.modeling.auto import AutoDraftModel
 
+    architectures = list(getattr(draft_config, "architectures", None) or ())
+    if (
+        architectures == ["DeepseekV4DSparkDraftModel"]
+        and cfg.training.attention_backend not in {"eager", "sdpa"}
+    ):
+        raise ValueError(
+            "DeepSeek-V4 DSpark's portable Ascend path currently supports "
+            "training.attention_backend=eager or sdpa; flex/FA/USP kernels do "
+            "not implement its dense parallel-block attention contract"
+        )
     draft_config._attn_implementation = cfg.training.attention_backend
+    # The released checkpoint overwrites every trainable DSpark tensor. Build
+    # its ~2.5B parameters directly in the requested dtype and skip random
+    # initialization to avoid a transient FP32 host copy and wasted normal_ work.
+    if architectures == ["DeepseekV4DSparkDraftModel"]:
+        draft_config._specforge_skip_initialization = bool(
+            cfg.model.draft_checkpoint_path
+        )
     draft_model = AutoDraftModel.from_config(
         draft_config,
         torch_dtype=_torch_dtype(cfg),
@@ -353,6 +384,12 @@ def _build_dflash_family_model(
     method_config["mask_token_id"] = mask_token_id
     method_config["target_layer_ids"] = list(draft_model.target_layer_ids)
 
+    # A drafter that carries its own input embedding never reads the target's:
+    # the noise embedding in dflash_family_model prefers draft_input_embeddings
+    # whenever it exists. Loading it anyway costs 0.986 GiB per rank on
+    # DeepSeek-V4. The LM head is still required -- it produces the teacher
+    # distribution.
+    head_only = getattr(draft_model, "draft_input_embeddings", None) is not None
     target_parts = TargetEmbeddingsAndHead.from_pretrained(
         cfg.model.target_model_path,
         embed_key=cfg.model.embedding_key,
@@ -361,6 +398,7 @@ def _build_dflash_family_model(
         device=_device().type,
         dtype=_torch_dtype(cfg),
         trust_remote_code=cfg.model.trust_remote_code,
+        head_only=head_only,
     )
     common = {
         "draft_model": draft_model,

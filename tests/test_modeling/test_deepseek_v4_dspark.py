@@ -753,6 +753,131 @@ if __name__ == "__main__":
     unittest.main(verbosity=2)
 
 
+class ExpertDispatchTest(unittest.TestCase):
+    """Grouping assignments by sort must match the per-expert `where` it replaced.
+
+    The old dispatch called `torch.where(indices == expert_id)` once per local
+    expert; each call reads back a data-dependent shape and stalls the device.
+    The replacement sorts once and reads back only the group boundaries, so it
+    has to reproduce the same token/slot pairs in the same order -- `index_add`
+    accumulates in float, and a different order is a different answer.
+    """
+
+    def _reference(self, indices, expert_id):
+        return torch.where(indices == expert_id)
+
+    def test_groups_match_the_where_reference_pair_for_pair(self):
+        torch.manual_seed(11)
+        config = tiny_config()
+        moe = DeepseekV4MoE(config)
+        indices = torch.randint(0, config.n_routed_experts, (17, config.num_experts_per_tok))
+        top_k = indices.shape[-1]
+
+        order, bounds = moe._group_assignments_by_expert(indices)
+
+        self.assertEqual(len(bounds), config.n_routed_experts + 1)
+        self.assertEqual(bounds[0], 0)
+        self.assertEqual(bounds[-1], indices.numel())
+        for expert_id in range(config.n_routed_experts):
+            slots = order[bounds[expert_id] : bounds[expert_id + 1]]
+            token, top = slots // top_k, slots % top_k
+            ref_token, ref_top = self._reference(indices, expert_id)
+            assert_close(token, ref_token, rtol=0, atol=0)
+            assert_close(top, ref_top, rtol=0, atol=0)
+
+    def test_every_assignment_is_placed_exactly_once(self):
+        torch.manual_seed(12)
+        config = tiny_config()
+        moe = DeepseekV4MoE(config)
+        indices = torch.randint(0, config.n_routed_experts, (9, config.num_experts_per_tok))
+
+        order, bounds = moe._group_assignments_by_expert(indices)
+
+        self.assertEqual(sorted(order.tolist()), list(range(indices.numel())))
+        # Boundaries are non-decreasing, so no group can borrow another's slots.
+        self.assertEqual(bounds, sorted(bounds))
+
+    def test_an_expert_nobody_routed_to_gets_an_empty_group(self):
+        config = tiny_config()
+        moe = DeepseekV4MoE(config)
+        # Every assignment goes to expert 0.
+        indices = torch.zeros(6, config.num_experts_per_tok, dtype=torch.long)
+
+        _, bounds = moe._group_assignments_by_expert(indices)
+
+        self.assertEqual(bounds[1] - bounds[0], indices.numel())
+        for expert_id in range(1, config.n_routed_experts):
+            self.assertEqual(bounds[expert_id + 1] - bounds[expert_id], 0)
+
+    def test_forward_and_backward_are_unchanged_by_the_dispatch(self):
+        torch.manual_seed(13)
+        config = tiny_config()
+        moe = DeepseekV4MoE(config)
+        x = torch.randn(2, 5, config.hidden_size, requires_grad=True)
+
+        output = moe(x)
+        output.sum().backward()
+        fast_input_grad = x.grad.clone()
+        fast_expert_grad = moe.experts[0].w1.weight.grad.clone()
+
+        # Recompute with the per-expert `where` the sort replaced.
+        reference = DeepseekV4MoE(config)
+        reference.load_state_dict(moe.state_dict())
+        original = DeepseekV4MoE._group_assignments_by_expert
+
+        def by_where(self, indices):
+            top_k = indices.shape[-1]
+            slots = []
+            bounds = [0]
+            for expert_id in range(self.n_experts):
+                token, top = torch.where(indices == expert_id)
+                slots.append(token * top_k + top)
+                bounds.append(bounds[-1] + token.numel())
+            return torch.cat(slots) if slots else torch.empty(0, dtype=torch.long), bounds
+
+        reference_input = x.detach().clone().requires_grad_(True)
+        with mock.patch.object(
+            DeepseekV4MoE, "_group_assignments_by_expert", by_where
+        ):
+            reference_output = reference(reference_input)
+            reference_output.sum().backward()
+
+        assert_close(output, reference_output, rtol=0, atol=0)
+        assert_close(fast_input_grad, reference_input.grad, rtol=0, atol=0)
+        assert_close(
+            fast_expert_grad, reference.experts[0].w1.weight.grad, rtol=0, atol=0
+        )
+
+
+class ExpertSortDtypeTest(unittest.TestCase):
+    """Sorting expert ids as float keeps the permutation and stays on AiCore.
+
+    Ascend has no AiCore ArgSort for integer dtypes and falls back to AiCpu,
+    which the driver warns about. Expert ids are small enough that float32
+    represents them exactly, so the float sort is the same sort.
+    """
+
+    def test_float_sort_reproduces_the_integer_permutation(self):
+        torch.manual_seed(21)
+        config = tiny_config()
+        moe = DeepseekV4MoE(config)
+        indices = torch.randint(0, config.n_routed_experts, (23, config.num_experts_per_tok))
+
+        order, _ = moe._group_assignments_by_expert(indices)
+
+        expected = torch.argsort(indices.reshape(-1), stable=True)
+        assert_close(order, expected, rtol=0, atol=0)
+
+    def test_the_largest_supported_expert_count_is_still_exact(self):
+        # float32 represents every integer up to 2**24; expert counts are many
+        # orders of magnitude below that, but pin the property that matters.
+        ids = torch.arange(4096, dtype=torch.long).repeat(2)
+        assert_close(
+            torch.argsort(ids.float(), stable=True),
+            torch.argsort(ids, stable=True),
+            rtol=0,
+            atol=0,
+        )
 
 
 class FsdpWrapGranularityTest(unittest.TestCase):
@@ -791,3 +916,278 @@ class FsdpWrapGranularityTest(unittest.TestCase):
         self.assertIsNotNone(model.confidence_head)
         self.assertIs(model.draft_input_embeddings, model.mtp[0].embed)
         self.assertIs(model.draft_output_head, model.mtp[-1].head)
+
+
+class SdpaDispatchTest(unittest.TestCase):
+    """Capability, chunking and recompute in the DSpark attention.
+
+    The failing allocation is one SDPA call asking for
+    128 x 64 x 134 x 512 x 4 = 2,248,146,944 bytes (2.09375 GiB), because
+    PyTorch's enable_gqa reference repeat_interleaves the key and value and its
+    math backend keeps bfloat16 intermediates in float32.
+    """
+
+    def setUp(self):
+        dsv4._SDPA_GQA_SUPPORT.clear()
+        for name in (dsv4._SDPA_HEAD_CHUNK_ENV, dsv4._SDPA_RECOMPUTE_ENV):
+            os.environ.pop(name, None)
+
+    tearDown = setUp
+
+    def _attention(self, heads=8):
+        config = tiny_config(num_attention_heads=heads, o_groups=2, head_dim=8)
+        attention = dsv4.DeepseekV4DSparkAttention(config)
+        attention.attn_implementation = "sdpa"
+        return config, attention
+
+    def _inputs(self, config, context=6):
+        x = torch.randn(1, config.dspark_block_size, config.hidden_size)
+        main_x = torch.randn(1, context, config.hidden_size)
+        positions = torch.arange(context + config.dspark_block_size).unsqueeze(0)
+        return x, main_x, positions
+
+    # -- P0-A: exception classification --------------------------------
+    def test_out_of_memory_propagates_and_is_not_retried(self):
+        config, attention = self._attention()
+        x, main_x, positions = self._inputs(config)
+        dsv4._SDPA_GQA_SUPPORT[("cpu", torch.float32)] = True
+        calls = []
+
+        def explode(*args, **kwargs):
+            calls.append(1)
+            raise torch.OutOfMemoryError("NPU out of memory")
+
+        with mock.patch.object(dsv4.F, "scaled_dot_product_attention", explode):
+            with self.assertRaises(torch.OutOfMemoryError):
+                attention(x, main_x, positions, None)
+
+        # A retry would ask the allocator for the same size a second time.
+        self.assertEqual(len(calls), 1)
+
+    def test_probe_reraises_out_of_memory_rather_than_declaring_no_gqa(self):
+        def explode(*args, **kwargs):
+            raise torch.OutOfMemoryError("NPU out of memory")
+
+        with mock.patch.object(dsv4.F, "scaled_dot_product_attention", explode):
+            with self.assertRaises(torch.OutOfMemoryError):
+                dsv4._sdpa_supports_gqa(torch.device("cpu"), torch.float32)
+        self.assertEqual(dsv4._SDPA_GQA_SUPPORT, {})
+
+    def test_capability_error_selects_the_hand_expanded_path_once(self):
+        probes = []
+        real = dsv4.F.scaled_dot_product_attention
+
+        def refuse(query, key, value, **kwargs):
+            if kwargs.pop("enable_gqa", False):
+                probes.append(1)
+                raise TypeError("scaled_dot_product_attention() got enable_gqa")
+            return real(query, key, value, **kwargs)
+
+        config, attention = self._attention()
+        x, main_x, positions = self._inputs(config)
+        with mock.patch.object(dsv4.F, "scaled_dot_product_attention", refuse):
+            attention(x, main_x, positions, None)
+            attention(x, main_x, positions, None)
+
+        # Probed once and cached, not re-probed per call or per chunk.
+        self.assertEqual(len(probes), 1)
+        self.assertFalse(dsv4._SDPA_GQA_SUPPORT[("cpu", torch.float32)])
+
+    # -- P0-B: head chunking -------------------------------------------
+    def test_heads_are_split_into_chunks(self):
+        os.environ[dsv4._SDPA_HEAD_CHUNK_ENV] = "2"
+        config, attention = self._attention(heads=8)
+        x, main_x, positions = self._inputs(config)
+        widths = []
+        real = dsv4.F.scaled_dot_product_attention
+
+        def record(query, key, value, **kwargs):
+            # The capability probe uses a length-1 query; real calls carry the
+            # block, so filter on that rather than on enable_gqa.
+            if query.shape[2] == config.dspark_block_size:
+                widths.append(query.shape[1])
+            return real(query, key, value, **kwargs)
+
+        with mock.patch.object(dsv4.F, "scaled_dot_product_attention", record):
+            attention(x, main_x, positions, None)
+
+        self.assertEqual(widths, [2, 2, 2, 2])
+
+    def test_key_value_is_never_expanded_when_gqa_is_available(self):
+        os.environ[dsv4._SDPA_HEAD_CHUNK_ENV] = "2"
+        config, attention = self._attention(heads=8)
+        x, main_x, positions = self._inputs(config)
+        key_heads = []
+        real = dsv4.F.scaled_dot_product_attention
+
+        def record(query, key, value, **kwargs):
+            if query.shape[2] == config.dspark_block_size:
+                key_heads.append(key.shape[1])
+            return real(query, key, value, **kwargs)
+
+        with mock.patch.object(dsv4.F, "scaled_dot_product_attention", record):
+            attention(x, main_x, positions, None)
+
+        self.assertTrue(key_heads)
+        self.assertTrue(all(heads == 1 for heads in key_heads), key_heads)
+
+    def test_chunked_matches_unchunked_forward_and_gradients(self):
+        torch.manual_seed(41)
+        config, attention = self._attention(heads=8)
+        x, main_x, positions = self._inputs(config)
+
+        def run(chunk):
+            os.environ[dsv4._SDPA_HEAD_CHUNK_ENV] = str(chunk)
+            attention.zero_grad(set_to_none=True)
+            xi = x.detach().clone().requires_grad_(True)
+            mi = main_x.detach().clone().requires_grad_(True)
+            out = attention(xi, mi, positions, None)
+            out.square().sum().backward()
+            return (
+                out.detach(),
+                xi.grad.clone(),
+                mi.grad.clone(),
+                attention.attn_sink.grad.clone(),
+            )
+
+        whole = run(0)
+        chunked = run(2)
+        # Chunking reassociates float sums, so this is agreement within
+        # accumulation noise, not bitwise identity.
+        for reference, actual, name in zip(
+            whole, chunked, ("output", "x grad", "main_x grad", "attn_sink grad")
+        ):
+            assert_close(actual, reference, rtol=1e-5, atol=1e-6, msg=name)
+
+    # -- P0-B': recompute ----------------------------------------------
+    def test_recompute_matches_the_saved_path(self):
+        torch.manual_seed(43)
+        config, attention = self._attention(heads=8)
+        x, main_x, positions = self._inputs(config)
+        os.environ[dsv4._SDPA_HEAD_CHUNK_ENV] = "2"
+
+        def run(recompute):
+            os.environ[dsv4._SDPA_RECOMPUTE_ENV] = "1" if recompute else "0"
+            attention.zero_grad(set_to_none=True)
+            xi = x.detach().clone().requires_grad_(True)
+            out = attention(xi, main_x, positions, None)
+            out.square().sum().backward()
+            return out.detach(), xi.grad.clone(), attention.attn_sink.grad.clone()
+
+        saved = run(False)
+        recomputed = run(True)
+        for reference, actual, name in zip(
+            saved, recomputed, ("output", "x grad", "attn_sink grad")
+        ):
+            assert_close(actual, reference, rtol=1e-5, atol=1e-6, msg=name)
+
+    def test_recompute_is_off_by_default(self):
+        self.assertFalse(dsv4._sdpa_recompute())
+        self.assertEqual(dsv4._sdpa_head_chunk(), 8)
+
+
+class ContextWindowGatherTest(unittest.TestCase):
+    """Each block reads its own window without copying the whole context.
+
+    The previous form expanded main_x to (batch, num_blocks, context_length,
+    width) and called torch.gather on that view, which makes the kernel
+    materialise num_blocks whole copies of the context. At 512 anchors that is
+    8.59 G elements against the 0.5 GiB actually needed -- the allocation that
+    failed with "Tried to allocate 35.00 GiB".
+    """
+
+    def _reference(self, main_x, position_ids, context_indices, context_length):
+        """The expand-then-gather this replaced, kept as the oracle."""
+        batch, num_blocks, window = context_indices.shape
+        width = main_x.shape[-1]
+        expanded = main_x.unsqueeze(1).expand(
+            batch, num_blocks, context_length, width
+        )
+        gathered = torch.gather(
+            expanded, 2, context_indices.unsqueeze(-1).expand(-1, -1, -1, width)
+        )
+        positions = torch.gather(
+            position_ids[:, :context_length]
+            .unsqueeze(1)
+            .expand(batch, num_blocks, context_length),
+            2,
+            context_indices,
+        )
+        return gathered, positions
+
+    def _fast(self, main_x, position_ids, context_indices, context_length):
+        batch, num_blocks, window = context_indices.shape
+        width = main_x.shape[-1]
+        offsets = (
+            torch.arange(
+                batch, device=main_x.device, dtype=context_indices.dtype
+            )
+            * context_length
+        ).view(batch, 1, 1)
+        flat = (context_indices + offsets).reshape(-1)
+        gathered = (
+            main_x.reshape(batch * context_length, width)
+            .index_select(0, flat)
+            .view(batch, num_blocks, window, width)
+        )
+        positions = (
+            position_ids[:, :context_length]
+            .reshape(-1)
+            .index_select(0, flat)
+            .view(batch, num_blocks, window)
+        )
+        return gathered, positions
+
+    def _case(self, batch=2, context_length=9, num_blocks=3, window=4, width=5):
+        torch.manual_seed(53)
+        main_x = torch.randn(batch, context_length, width, requires_grad=True)
+        position_ids = torch.arange(batch * context_length).view(
+            batch, context_length
+        )
+        context_indices = torch.randint(
+            0, context_length, (batch, num_blocks, window)
+        )
+        return main_x, position_ids, context_indices, context_length
+
+    def test_matches_the_expand_and_gather_it_replaces(self):
+        main_x, positions, indices, length = self._case()
+        expected, expected_positions = self._reference(
+            main_x, positions, indices, length
+        )
+        actual, actual_positions = self._fast(main_x, positions, indices, length)
+        assert_close(actual, expected, rtol=0, atol=0)
+        assert_close(actual_positions, expected_positions, rtol=0, atol=0)
+
+    def test_gradients_match(self):
+        main_x, positions, indices, length = self._case()
+        reference_input = main_x.detach().clone().requires_grad_(True)
+        self._reference(reference_input, positions, indices, length)[0].square().sum().backward()
+        fast_input = main_x.detach().clone().requires_grad_(True)
+        self._fast(fast_input, positions, indices, length)[0].square().sum().backward()
+        # A row read by several blocks accumulates in both forms.
+        assert_close(fast_input.grad, reference_input.grad, rtol=0, atol=0)
+
+    def test_repeated_and_clamped_indices_still_agree(self):
+        # Blocks near the start clamp to 0, so the same row feeds many windows.
+        main_x, positions, _, length = self._case()
+        indices = torch.zeros(2, 3, 4, dtype=torch.long)
+        expected = self._reference(main_x, positions, indices, length)[0]
+        actual = self._fast(main_x, positions, indices, length)[0]
+        assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_model_forward_still_runs_end_to_end(self):
+        config = tiny_config()
+        model = DeepseekV4DSparkDraftModel(config)
+        blocks, block = 3, config.dspark_block_size
+        context = 7
+        noise = torch.randn(1, blocks * block, config.hidden_size)
+        target = torch.randn(
+            1, context, config.hidden_size * len(config.dspark_target_layer_ids)
+        )
+        positions = torch.arange(context + blocks * block).unsqueeze(0)
+        out = model(
+            position_ids=positions, noise_embedding=noise, target_hidden=target
+        )
+        self.assertEqual(
+            tuple(out.shape), (1, blocks * block, config.hidden_size)
+        )

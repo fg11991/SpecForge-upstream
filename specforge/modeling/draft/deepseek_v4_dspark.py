@@ -279,6 +279,73 @@ class DeepseekV4GroupedLinear(nn.Linear):
         return result.reshape(*batch_shape, self.groups, out_per_group)
 
 
+_SDPA_HEAD_CHUNK_ENV = "SPECFORGE_SDPA_HEAD_CHUNK"
+_SDPA_RECOMPUTE_ENV = "SPECFORGE_SDPA_RECOMPUTE"
+_SDPA_DEFAULT_HEAD_CHUNK = 8
+_SDPA_GQA_SUPPORT: Dict[tuple, bool] = {}
+
+
+def _sdpa_head_chunk() -> int:
+    """Query heads per SDPA call; 0 or negative means one call for all heads."""
+    raw = os.environ.get(_SDPA_HEAD_CHUNK_ENV, "").strip()
+    if not raw:
+        return _SDPA_DEFAULT_HEAD_CHUNK
+    try:
+        return int(raw)
+    except ValueError:
+        return _SDPA_DEFAULT_HEAD_CHUNK
+
+
+def _sdpa_recompute() -> bool:
+    """Whether to recompute each head chunk in backward instead of saving it.
+
+    Off by default so the chunking change can be measured on its own; whether
+    it is needed depends on what SDPA actually retains, which only a
+    saved-tensor or profiler reading on the device can say.
+    """
+    return os.environ.get(_SDPA_RECOMPUTE_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _sdpa_supports_gqa(device: torch.device, dtype: torch.dtype) -> bool:
+    """Whether this build's SDPA accepts ``enable_gqa``, probed once per device.
+
+    The probe runs on a 32-byte tensor, so it cannot fail for memory --
+    which is the point. Capability has to be settled away from the real call,
+    because at the real call an OutOfMemoryError is indistinguishable from a
+    missing argument by exception type alone: both are RuntimeError.
+    ``torch.OutOfMemoryError`` is re-raised here as well, so a probe issued on
+    an already-full device is never mistaken for an unsupported build.
+    """
+    key = (device.type, dtype)
+    cached = _SDPA_GQA_SUPPORT.get(key)
+    if cached is not None:
+        return cached
+    query = torch.zeros(1, 2, 1, 8, device=device, dtype=dtype)
+    shared = torch.zeros(1, 1, 1, 8, device=device, dtype=dtype)
+    try:
+        F.scaled_dot_product_attention(query, shared, shared, enable_gqa=True)
+        supported = True
+    except torch.OutOfMemoryError:
+        raise
+    except (TypeError, RuntimeError) as exc:
+        logger.warning(
+            "SDPA rejected enable_gqa on %s/%s (%s: %s); expanding the "
+            "key/value by hand instead",
+            device.type,
+            dtype,
+            type(exc).__name__,
+            exc,
+        )
+        supported = False
+    _SDPA_GQA_SUPPORT[key] = supported
+    return supported
+
+
 class DeepseekV4DSparkAttention(nn.Module):
     """Dense training reference for DSpark's shared-latent V4 attention."""
 
@@ -370,17 +437,26 @@ class DeepseekV4DSparkAttention(nn.Module):
         so the additive mask alone sets that column's logit to the sink, and the
         matching all-zero value contributes nothing to the output.
 
-        Unlike the eager path this accumulates at the activation dtype rather
-        than forcing float32, which is the point of selecting it.
+        Query heads are processed in chunks. PyTorch's own reference for
+        ``enable_gqa`` is ``key.repeat_interleave(...)``, and its math backend
+        keeps every intermediate in float32 when the inputs are bfloat16, so a
+        single call materialises the key and value at the full head count in
+        fp32. For this model that is
+        ``128 x 64 x 134 x 512 x 4 = 2,248,146,944`` bytes -- 2.09375 GiB in
+        one allocation, which is the request that fails. Chunking bounds each
+        request; whether the chunks' expansions are also retained until
+        backward is a saved-tensor question this cannot settle statically,
+        which is what ``SPECFORGE_SDPA_RECOMPUTE`` is for.
         """
 
         batch, query_len, num_heads, head_dim = q.shape
         queries = q.transpose(1, 2)
-        shared = kv.unsqueeze(1).expand(batch, num_heads, -1, head_dim)
-        pad = shared.new_zeros(batch, num_heads, 1, head_dim)
         # One tensor serves as key and value: its zero row is the sink's key
-        # (score 0) and the sink's value (no contribution).
-        keys = torch.cat((shared, pad), dim=2)
+        # (score 0) and the sink's value (no contribution). Append the row
+        # BEFORE broadcasting over heads so nothing here materialises the
+        # broadcast; whether SDPA does internally is a separate question.
+        pad = kv.new_zeros(batch, 1, head_dim)
+        single_head = torch.cat((kv, pad), dim=1).unsqueeze(1)
 
         bias = self._additive_mask(attention_mask, dtype=queries.dtype)
         if bias is None:
@@ -391,10 +467,64 @@ class DeepseekV4DSparkAttention(nn.Module):
             (bias, sink.expand(batch, num_heads, query_len, 1)), dim=-1
         )
 
-        context = F.scaled_dot_product_attention(
-            queries, keys, keys, attn_mask=bias, scale=self.scaling
-        )
+        chunk = _sdpa_head_chunk()
+        if chunk <= 0 or chunk >= num_heads:
+            context = self._sdpa_heads(queries, single_head, bias)
+        else:
+            parts = [
+                self._sdpa_heads(
+                    queries[:, start : start + chunk],
+                    single_head,
+                    bias[:, start : start + chunk],
+                )
+                for start in range(0, num_heads, chunk)
+            ]
+            # Chunks are produced in head order, so the concatenation restores
+            # exactly the layout the output projection's grouping expects.
+            context = torch.cat(parts, dim=1)
         return context.transpose(1, 2)
+
+    def _sdpa_heads(self, queries, single_head, bias):
+        """One SDPA call over a slice of the query heads.
+
+        Optionally recomputed in backward instead of saved: the recompute
+        boundary is the chunk, so at most one chunk's internal expansion is
+        alive at a time rather than all of them.
+        """
+        if not _sdpa_recompute() or not torch.is_grad_enabled():
+            return self._sdpa_call(queries, single_head, bias)
+        return torch.utils.checkpoint.checkpoint(
+            self._sdpa_call,
+            queries,
+            single_head,
+            bias,
+            use_reentrant=False,
+        )
+
+    def _sdpa_call(self, queries, single_head, bias):
+        """Dispatch one SDPA call, expanding by hand only where GQA is absent.
+
+        Deliberately has no try/except. ``torch.OutOfMemoryError`` subclasses
+        ``RuntimeError``, so catching RuntimeError here would read an
+        allocation failure as "this build has no enable_gqa" and immediately
+        retry the same shape through the hand-expanded path -- a second
+        request for the same 2.09 GiB. Capability is decided once, by probe,
+        before any real call.
+        """
+        if _sdpa_supports_gqa(queries.device, queries.dtype):
+            return F.scaled_dot_product_attention(
+                queries,
+                single_head,
+                single_head,
+                attn_mask=bias,
+                scale=self.scaling,
+                enable_gqa=True,
+            )
+        heads = queries.shape[1]
+        expanded = single_head.expand(-1, heads, -1, -1)
+        return F.scaled_dot_product_attention(
+            queries, expanded, expanded, attn_mask=bias, scale=self.scaling
+        )
 
     def forward(
         self,
@@ -701,19 +831,23 @@ class DeepseekV4MoE(nn.Module):
         # collective-order divergence on highly imbalanced routes.
         local_routed = routed_input.float() * 0.0
         local_routed = local_routed + weights.float().sum() * 0.0
+        order, bounds = self._group_assignments_by_expert(indices)
+        top_k = indices.shape[-1]
         for expert_id in range(self.start_expert, self.end_expert):
-            token, top = torch.where(indices == expert_id)
-            if token.numel() == 0:
+            start, end = bounds[expert_id], bounds[expert_id + 1]
+            expert = self.experts[expert_id]
+            if start == end:
                 # DDP requires every registered parameter to join every
                 # reduction. Preserve exact MoE output math while attaching a
                 # zero gradient to experts unused by this microbatch.
-                expert = self.experts[expert_id]
                 local_routed = local_routed + sum(
                     parameter.reshape(-1)[0].float() * 0.0
                     for parameter in expert.parameters()
                 )
                 continue
-            expert = self.experts[expert_id]
+            slots = order[start:end]
+            token = slots // top_k
+            top = slots % top_k
             local_routed = local_routed.index_add(
                 0,
                 token,
@@ -1167,20 +1301,32 @@ class DeepseekV4DSparkDraftModel(DraftVocabMappingMixin, PreTrainedModel):
             raw_context_indices < context_length
         )
         context_indices = raw_context_indices.clamp(0, context_length - 1)
-        expanded_main = main_x.unsqueeze(1).expand(
-            batch, num_blocks, context_length, width
+        # Gather the window rows straight out of the context, never a
+        # per-block copy of it. Expanding to (batch, num_blocks,
+        # context_length, width) and calling torch.gather on that view asks the
+        # kernel to materialise the broadcast: num_blocks whole copies of the
+        # context, of which only `window` rows each are ever read. At 512
+        # anchors that is 8.59 G elements -- 16 GiB in bf16, 32 GiB if the
+        # kernel promotes -- against the 0.5 GiB actually needed, a factor of
+        # context_length / window = 32. index_select over the flattened context
+        # takes a 1-D index, so nothing is broadcast and nothing is
+        # materialised.
+        batch_offsets = (
+            torch.arange(
+                batch, device=main_x.device, dtype=context_indices.dtype
+            )
+            * context_length
+        ).view(batch, 1, 1)
+        flat_index = (context_indices + batch_offsets).reshape(-1)
+        gathered_main = main_x.reshape(batch * context_length, width).index_select(
+            0, flat_index
         )
-        gathered_main = torch.gather(
-            expanded_main,
-            2,
-            context_indices.unsqueeze(-1).expand(-1, -1, -1, width),
-        )
-        context_positions = torch.gather(
+        gathered_main = gathered_main.view(batch, num_blocks, window, width)
+        context_positions = (
             position_ids[:, :context_length]
-            .unsqueeze(1)
-            .expand(batch, num_blocks, context_length),
-            2,
-            context_indices,
+            .reshape(-1)
+            .index_select(0, flat_index)
+            .view(batch, num_blocks, window)
         )
 
         block_valid = context_valid.any(dim=-1)
