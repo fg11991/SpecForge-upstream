@@ -156,13 +156,14 @@ def _validate_training_topology(
             )
         if (
             cfg.training.tp_size != 1
+            or cfg.training.expert_parallel_size != 1
             or cfg.training.sp_ulysses_size != 1
             or cfg.training.sp_ring_size != 1
         ):
             raise ValueError(
                 "the disaggregated online consumer uses every trainer rank for "
                 "data parallelism; configure target TP on the external server and "
-                "keep training.tp_size/sp sizes at 1"
+                "keep training.tp_size/expert_parallel_size/sp sizes at 1"
             )
 
     if cfg.training.attention_backend == "usp" and mode is not FeatureMode.OFFLINE:

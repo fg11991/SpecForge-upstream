@@ -24,6 +24,8 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from specforge.config.draft_config import is_deepseek_v4_dspark_draft_config
+
 # SGLang reserves one generated-token slot plus five internal slots, and its
 # request validator rejects ``input_len >= context_len - 6``.  Accepting a
 # prompt whose length is exactly ``data.max_length`` therefore needs 7 slots.
@@ -562,6 +564,9 @@ class TrainingConfig(StrictConfigModel):
     #: Trainer tensor parallelism. The unified runtime currently requires one;
     #: target-model TP belongs to external or managed capture servers.
     tp_size: int = Field(default=1, gt=0)
+    #: Draft MoE expert parallelism. EP peers consume the same offline feature
+    #: batch and own disjoint routed experts.
+    expert_parallel_size: int = Field(default=1, gt=0)
     sp_ulysses_size: int = Field(default=1, gt=0)
     sp_ring_size: int = Field(default=1, gt=0)
     dist_timeout: int = Field(default=10, gt=0)
@@ -637,6 +642,11 @@ class TrainingConfig(StrictConfigModel):
             raise ValueError(
                 "training.sp_ulysses_size/sp_ring_size require "
                 "training.attention_backend=usp"
+            )
+        if self.expert_parallel_size > 1 and self.strategy != "dspark":
+            raise ValueError(
+                "training.expert_parallel_size>1 is currently supported only "
+                "for training.strategy=dspark"
             )
         return self
 
@@ -738,6 +748,33 @@ class Config(StrictConfigModel):
         mode = self.mode
         deployment = self.deployment.mode
         role = self.training.role
+
+        if self.training.expert_parallel_size > 1 and self.mode == "offline":
+            source = self.model.draft_model_config
+            if not source:
+                raise ValueError(
+                    "training.expert_parallel_size>1 requires an explicit "
+                    "DeepseekV4DSparkDraftModel draft config"
+                )
+            path = os.path.expanduser(source.removeprefix("file://"))
+            if os.path.isdir(path):
+                path = os.path.join(path, "config.json")
+            if not os.path.isfile(path):
+                raise ValueError(
+                    "training.expert_parallel_size>1 requires a local draft "
+                    "config so DeepseekV4DSparkDraftModel can be validated"
+                )
+            try:
+                with open(path, encoding="utf-8") as stream:
+                    draft_payload = json.load(stream)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"cannot read draft config {source!r}: {exc}") from exc
+            if not is_deepseek_v4_dspark_draft_config(draft_payload):
+                raise ValueError(
+                    "training.expert_parallel_size>1 requires draft architecture "
+                    "DeepseekV4DSparkDraftModel or an official DeepseekV4ForCausalLM "
+                    "config with DSpark metadata"
+                )
 
         if mode == "online" and deployment != "disaggregated":
             raise ValueError(
@@ -926,6 +963,7 @@ class Config(StrictConfigModel):
             and deployment == "disaggregated"
             and (
                 self.training.tp_size != 1
+                or self.training.expert_parallel_size != 1
                 or self.training.sp_ulysses_size != 1
                 or self.training.sp_ring_size != 1
             )
@@ -933,7 +971,7 @@ class Config(StrictConfigModel):
             raise ValueError(
                 "the disaggregated online consumer uses every trainer rank for "
                 "data parallelism; configure target TP on the external server and "
-                "keep training.tp_size/sp sizes at 1"
+                "keep training.tp_size/expert_parallel_size/sp sizes at 1"
             )
         return self
 
@@ -946,16 +984,17 @@ class Config(StrictConfigModel):
             raise ValueError(f"world_size must be positive, got {world_size}")
         tp_size = self.training.tp_size
         sp_size = self.training.sp_ulysses_size * self.training.sp_ring_size
+        draft_mp_size = sp_size * self.training.expert_parallel_size
         if world_size % tp_size:
             raise ValueError(
                 f"world_size={world_size} must be divisible by "
                 f"training.tp_size={tp_size}"
             )
-        if world_size % sp_size:
+        if world_size % draft_mp_size:
             raise ValueError(
-                f"world_size={world_size} must be divisible by draft sequence "
-                f"parallel size {sp_size} "
-                "(sp_ulysses_size * sp_ring_size)"
+                f"world_size={world_size} must be divisible by draft model "
+                f"parallel size {draft_mp_size} "
+                "(expert_parallel_size * sp_ulysses_size * sp_ring_size)"
             )
 
     @classmethod

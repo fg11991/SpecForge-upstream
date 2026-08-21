@@ -29,6 +29,8 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple
 
+from specforge.config.draft_config import is_deepseek_v4_dspark_draft_config
+
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
@@ -100,6 +102,37 @@ def _draft_config_from_dict(payload: Dict[str, Any]) -> "PretrainedConfig":
 
     payload = dict(payload)
     architectures = payload.get("architectures") or []
+
+    def _official_dspark_num_layers(official: Dict[str, Any]) -> int:
+        """Recover the DSpark stage count from an official V4 config.
+
+        The public HF config does not carry it directly: ``n_mtp_layers`` only
+        lives in the release's ``inference/config.json``, and
+        ``num_nextn_predict_layers`` means something else (it is 1 for a model
+        whose checkpoint ships three ``mtp.*`` stages).  ``compress_ratios``
+        does carry it: it has one entry per unified layer, i.e. the target
+        depth plus one trailing zero-ratio entry per DSpark stage.
+        """
+
+        ratios = official.get("compress_ratios")
+        depth = official.get("num_hidden_layers")
+        if isinstance(ratios, (list, tuple)) and isinstance(depth, int):
+            stages = len(ratios) - depth
+            if stages > 0:
+                return stages
+        return 3
+
+    if (
+        is_deepseek_v4_dspark_draft_config(payload)
+        and list(architectures) == ["DeepseekV4ForCausalLM"]
+    ):
+        # Official V4 DSpark is fused into a target checkpoint whose public HF
+        # config names the target architecture.  SpecForge materializes only
+        # mtp.{0,1,2}, so convert that config to the registered draft class.
+        architectures = ["DeepseekV4DSparkDraftModel"]
+        payload["architectures"] = architectures
+        payload["model_type"] = "deepseek_v4_dspark"
+        payload.setdefault("dspark_num_layers", _official_dspark_num_layers(payload))
     if not isinstance(architectures, (list, tuple)) or len(architectures) != 1:
         raise ValueError(
             "draft config must name exactly one architecture; " f"got {architectures!r}"
@@ -342,6 +375,12 @@ def _runtime_state_file(source: str) -> Optional[str]:
     return os.path.join(checkpoint_dir, _STATE_FILE)
 
 
+def is_specforge_checkpoint(source: str) -> bool:
+    """Whether ``source`` resolves to SpecForge's training-state layout."""
+
+    return _runtime_state_file(source) is not None
+
+
 def _load_specforge_draft_state(
     state_path: str, *, expected_strategy: str
 ) -> Dict[str, Any]:
@@ -367,6 +406,10 @@ def _load_specforge_draft_state(
             f"warm-start checkpoint {state_path} was written by strategy "
             f"{saved_strategy!r}; this run trains {expected_strategy!r}"
         )
+    if int(state.get("expert_parallel_size", 1)) > 1:
+        from specforge.training.checkpoint import consolidate_draft_state
+
+        return consolidate_draft_state(os.path.dirname(state_path), state)
     return state["draft_state_dict"]
 
 
@@ -467,6 +510,7 @@ def warm_start_draft_model(
 __all__ = [
     "WarmStartReport",
     "draft_config_dict",
+    "is_specforge_checkpoint",
     "load_draft_config_source",
     "resolve_draft_config",
     "warm_start_draft_model",

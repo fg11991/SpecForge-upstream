@@ -17,8 +17,30 @@ def _normalize_hidden_states(
     max_len: int,
     *,
     description: str,
+    reduce_native_v4_streams: bool = True,
 ):
     hidden_states = raw[key]
+    if hidden_states.dim() in {4, 5} and not reduce_native_v4_streams:
+        raise ValueError(
+            f"offline {description} must be captured after the target V4 "
+            "hc_head, not as raw mHC streams"
+        )
+    if hidden_states.dim() == 5:
+        if hidden_states.shape[0] != 1:
+            raise ValueError(
+                f"offline {description} native V4 capture must have shape "
+                f"[1, seq, layers, hc, width], got {tuple(hidden_states.shape)}"
+            )
+        hidden_states = hidden_states.mean(dim=-2).flatten(-2).squeeze(0)
+    elif hidden_states.dim() == 4:
+        # [1, seq, hc, width] for one native V4 hidden. Multiple selected
+        # layers are already concatenated by the capture backend.
+        if hidden_states.shape[0] != 1:
+            raise ValueError(
+                f"offline {description} native V4 capture must have a leading "
+                f"batch of one, got {tuple(hidden_states.shape)}"
+            )
+        hidden_states = hidden_states.mean(dim=-2).squeeze(0)
     if hidden_states.dim() == 3:
         if hidden_states.shape[0] != 1:
             raise ValueError(
@@ -77,6 +99,7 @@ def normalize_dspark_offline_sample(raw, max_len: int):
         "target_last_hidden_states",
         max_len,
         description="DSpark target_last_hidden_states",
+        reduce_native_v4_streams=False,
     )
     expected_length = normalized["input_ids"].shape[1]
     if target_last_hidden_states.shape[1] != expected_length:

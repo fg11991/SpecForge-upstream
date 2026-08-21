@@ -132,6 +132,7 @@ def _train(resolved) -> int:
     init_distributed(
         timeout=cfg.training.dist_timeout,
         tp_size=cfg.training.tp_size,
+        expert_parallel_size=cfg.training.expert_parallel_size,
         sp_ulysses_size=cfg.training.sp_ulysses_size,
         sp_ring_size=cfg.training.sp_ring_size,
     )

@@ -57,6 +57,8 @@ def create_dflash_sdpa_mask(
     block_size,
     device,
     sliding_window: Optional[int] = None,
+    include_anchor_context: bool = False,
+    parallel_draft_visibility: bool = False,
 ):
     """Construct a full or sliding dense boolean DFlash mask."""
 
@@ -78,16 +80,22 @@ def create_dflash_sdpa_mask(
         block_size, dim=2
     )
 
-    mask_context = (kv_indices < S) & (kv_indices < anchor_expanded)
+    context_limit = anchor_expanded + int(include_anchor_context)
+    mask_context = (kv_indices < S) & (kv_indices < context_limit)
     if sliding_window is not None:
-        # The current draft token occupies one slot in the window.
-        context_lower_bound = anchor_expanded + q_block_offsets - (sliding_window - 1)
+        if parallel_draft_visibility:
+            context_lower_bound = context_limit - sliding_window
+        else:
+            # The current draft token occupies one slot in the window.
+            context_lower_bound = anchor_expanded + q_block_offsets - (
+                sliding_window - 1
+            )
         mask_context = mask_context & (kv_indices >= context_lower_bound)
 
     is_draft = kv_indices >= S
     kv_block_ids = (kv_indices - S) // block_size
     mask_draft = is_draft & (q_block_ids == kv_block_ids)
-    if sliding_window is not None:
+    if sliding_window is not None and not parallel_draft_visibility:
         kv_block_offsets = (kv_indices - S) % block_size
         mask_draft = mask_draft & (kv_block_offsets <= q_block_offsets)
 
@@ -105,6 +113,8 @@ def create_dflash_block_mask(
     device: torch.device,
     flex_block_size=None,
     sliding_window: Optional[int] = None,
+    include_anchor_context: bool = False,
+    parallel_draft_visibility: bool = False,
 ):
     """Construct a full or sliding Flex Attention mask for DFlash training."""
 
@@ -120,16 +130,22 @@ def create_dflash_block_mask(
         is_context = kv_idx < S
         # Strictly less than: matches inference where target_hidden[anchor_pos]
         # is not available as context.
-        mask_context = is_context & (kv_idx < anchor_pos)
+        context_limit = anchor_pos + int(include_anchor_context)
+        mask_context = is_context & (kv_idx < context_limit)
         if sliding_window is not None:
-            # The current draft token occupies one slot in the window.
-            context_lower_bound = anchor_pos + q_block_offset - (sliding_window - 1)
+            if parallel_draft_visibility:
+                context_lower_bound = context_limit - sliding_window
+            else:
+                # The current draft token occupies one slot in the window.
+                context_lower_bound = anchor_pos + q_block_offset - (
+                    sliding_window - 1
+                )
             mask_context = mask_context & (kv_idx >= context_lower_bound)
 
         is_draft = kv_idx >= S
         kv_block_id = (kv_idx - S) // block_size
         mask_draft = is_draft & (q_block_id == kv_block_id)
-        if sliding_window is not None:
+        if sliding_window is not None and not parallel_draft_visibility:
             kv_block_offset = (kv_idx - S) % block_size
             mask_draft = mask_draft & (kv_block_offset <= q_block_offset)
 

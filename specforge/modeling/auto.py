@@ -33,7 +33,21 @@ class AutoDraftModel(AutoModelForCausalLMBase):
             A model instance.
         """
         _model_cls = cls._model_cls_from_config(config)
-        model = _model_cls(config, **config_kwargs)
+        use_construction_dtype = (
+            torch_dtype is not None
+            and _model_cls.__name__ == "DeepseekV4DSparkDraftModel"
+        )
+        previous_dtype = None
+        if use_construction_dtype:
+            import torch
+
+            previous_dtype = torch.get_default_dtype()
+            torch.set_default_dtype(torch_dtype)
+        try:
+            model = _model_cls(config, **config_kwargs)
+        finally:
+            if previous_dtype is not None:
+                torch.set_default_dtype(previous_dtype)
 
         # Convert model to specified dtype if provided
         if torch_dtype is not None:

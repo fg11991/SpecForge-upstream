@@ -359,7 +359,7 @@ class DSparkDraftVocabTest(unittest.TestCase):
                     "torch.distributed",
                     is_available=lambda: True,
                     is_initialized=lambda: True,
-                    get_world_size=lambda: 4,
+                    get_world_size=lambda group=None: 4,
                     all_reduce=lambda tensor, **kw: calls.append(tensor),
                 ):
                     model(**_inputs())

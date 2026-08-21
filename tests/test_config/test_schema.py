@@ -636,6 +636,61 @@ class ConfigSchemaTest(unittest.TestCase):
                 }
             )
 
+    def test_dspark_expert_parallel_topology_is_typed_and_validated(self):
+        payload = _payload("dspark")
+        payload["model"]["draft_model_config"] = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            "configs",
+            "deepseek-v4-flash-dspark.json",
+        )
+        payload["training"] = {
+            "strategy": "dspark",
+            "attention_backend": "sdpa",
+            "expert_parallel_size": 4,
+        }
+        config = Config.model_validate(payload)
+
+        config.validate_world_size(8)
+        with self.assertRaisesRegex(ValueError, "draft model parallel size"):
+            config.validate_world_size(6)
+
+        with open(payload["model"]["draft_model_config"], encoding="utf-8") as stream:
+            official_payload = json.load(stream)
+        official_payload["architectures"] = ["DeepseekV4ForCausalLM"]
+        official_payload["model_type"] = "deepseek_v4"
+        with tempfile.TemporaryDirectory() as directory:
+            official_path = os.path.join(directory, "config.json")
+            with open(official_path, "w", encoding="utf-8") as stream:
+                json.dump(official_payload, stream)
+            official = copy.deepcopy(payload)
+            official["model"]["draft_model_config"] = directory
+            official["training"]["expert_parallel_size"] = 2
+            official_config = Config.model_validate(official)
+        official_config.validate_world_size(8)
+
+        non_moe = _payload("dflash")
+        non_moe["training"] = {
+            "strategy": "dflash",
+            "expert_parallel_size": 2,
+        }
+        with self.assertRaisesRegex(ValidationError, "only.*dspark"):
+            Config.model_validate(non_moe)
+
+        dense_dspark = _payload("dspark")
+        dense_dspark["training"] = {
+            "strategy": "dspark",
+            "expert_parallel_size": 2,
+        }
+        with self.assertRaisesRegex(
+            ValidationError, "DeepseekV4DSparkDraftModel"
+        ):
+            Config.model_validate(dense_dspark)
+
+        online = _online_payload("dspark")
+        online["training"]["expert_parallel_size"] = 2
+        with self.assertRaisesRegex(ValidationError, "keep.*expert_parallel_size"):
+            Config.model_validate(online)
+
     def test_overrides_coerce_and_revalidate(self):
         cfg = Config.model_validate(MINIMAL)
         out = apply_overrides(

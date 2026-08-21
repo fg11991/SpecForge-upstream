@@ -37,7 +37,10 @@ from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 ALGORITHM_NAME = "dspark"
 DRAFT_ARCHITECTURE = "DSparkDraftModel"
-COMPATIBLE_DRAFT_ARCHITECTURES = frozenset({DRAFT_ARCHITECTURE})
+DEEPSEEK_V4_DRAFT_ARCHITECTURE = "DeepseekV4DSparkDraftModel"
+COMPATIBLE_DRAFT_ARCHITECTURES = frozenset(
+    {DRAFT_ARCHITECTURE, DEEPSEEK_V4_DRAFT_ARCHITECTURE}
+)
 
 
 def build_step(wrapped_model, *, target_head=None, **_options):
@@ -51,7 +54,13 @@ def resume_contract(_config, draft_model, training_model):
     """Persist resolved DSpark model, sampling, and objective semantics."""
 
     contract = {
-        "dspark_draft_num_hidden_layers": int(draft_model.config.num_hidden_layers),
+        "dspark_draft_num_hidden_layers": int(
+            getattr(
+                draft_model.config,
+                "dspark_num_layers",
+                draft_model.config.num_hidden_layers,
+            )
+        ),
         "dspark_target_layer_ids": tuple(
             int(layer_id) for layer_id in draft_model.target_layer_ids
         ),

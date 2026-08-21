@@ -1,0 +1,91 @@
+# DeepSeek-V4-Flash official three-stage MoE DSpark fine-tuning on 8 Ascend NPUs.
+# First capture offline features from layers 40/41/42 and the target last hidden
+# state. Replace local paths before launch; do not use flex_attention on NPU.
+model:
+  target_model_path: deepseek-ai/DeepSeek-V4-Flash-DSpark
+  draft_model_config: configs/deepseek-v4-flash-dspark.json
+  draft_checkpoint_path: deepseek-ai/DeepSeek-V4-Flash-DSpark
+  target_backend: sglang
+  trust_remote_code: true
+  # HF export names. A checkpoint published under DeepSeek's runtime names
+  # (embed.weight / head.weight, as the released W8A8 build is) resolves
+  # automatically, so these do not need changing for it.
+  embedding_key: model.embed_tokens.weight
+  lm_head_key: lm_head.weight
+  torch_dtype: bfloat16
+
+data:
+  hidden_states_path: ./cache/hidden_states/deepseek-v4-flash-dspark
+  max_length: 4096
+  chat_template: deepseek-v4
+  cache_dir: ./cache
+
+training:
+  strategy: dspark
+  num_epochs: 6
+  max_steps: 10000
+  batch_size: 1
+  accumulation_steps: 4
+  learning_rate: 2.0e-4
+  warmup_ratio: 0.04
+  # Measured: the gradient norm's running geometric mean settles around 4.2
+  # once the sqrt(8) expert-parallel overcount is gone. At 1.0 every single
+  # step was clipped, which replaced the learning-rate schedule with normalized
+  # gradients; at 5.0 clipping is back to catching outliers.
+  max_grad_norm: 5.0
+  # Required at EP=8, and measured, not assumed: 2.934 B trainable parameters
+  # per rank need 32.8 GiB of fp32 master plus Adam moments, on top of 10.9 GiB
+  # of bf16 weights and gradients and 2.0 GiB of frozen tables. On device that
+  # OOMs a 61 GiB card once activations land. Sharding cannot rescue it either:
+  # 27 GiB of that state belongs to the 2.416 B routed-expert parameters this
+  # rank alone owns, and expert parallelism has already partitioned them, so
+  # there is no replica left to split. Only the 0.518 B replicated parameters
+  # could be sharded, worth 5.4 GiB.
+  #
+  # This is the one recipe in the repo that needs it, because it is the only one
+  # whose drafter is a MoE. The cost is a host round trip per step; keep
+  # OMP_NUM_THREADS set to cores/nproc_per_node so the eight ranks do not
+  # oversubscribe the host while running AdamW.
+  optimizer_cpu_offload: true
+  # "eager", and measured, not assumed. The comment this replaces claimed sdpa
+  # accumulates at the activation dtype -- it does not here. head_dim is 512 and
+  # the learned sink needs a float additive mask, which together take SDPA off
+  # every fused kernel and onto the math path, where PyTorch keeps bfloat16
+  # intermediates in float32 AND expands the single key/value head to all 64
+  # (enable_gqa's reference implementation is key.repeat_interleave).
+  #
+  # The eager path contracts with einsum("bqhd,bkd->bhqk"): kv carries no head
+  # index at all, so it is never expanded. Per stage that is 235 MB against
+  # 2144 MB, a factor of 9. On the device it is also about twice as fast --
+  # 8-9 s per step against 16.6 s -- because the expansion costs bandwidth.
+  # sdpa is the right default for long sequences with many KV heads; this
+  # drafter is the opposite shape.
+  attention_backend: eager
+  # EP=8 is the minimum-memory option and gives DP=1 on eight cards: replicated
+  # attention/mHC/shared-expert work has no throughput scaling. Prefer EP=4/DP=2
+  # or EP=2/DP=4 when memory permits; use EP=8 only when smaller EP cannot fit.
+  expert_parallel_size: 8
+  num_anchors: 128
+  objective_chunk_blocks: 16
+  loss_decay_gamma: 7
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 1000
+  # Retain only the two newest very large EP checkpoints.
+  max_checkpoints: 2
+  log_interval: 20
+  dist_timeout: 120
+  seed: 42
+
+tracking:
+  report_to: tensorboard
+
+run_id: deepseek-v4-flash-dspark-offline-npu
+output_dir: ./outputs/deepseek-v4-flash-dspark-offline-npu
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8

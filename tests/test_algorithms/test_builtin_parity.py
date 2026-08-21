@@ -265,6 +265,50 @@ class BuiltinProviderParityTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "mismatched sequence lengths"):
             normalize(raw)
 
+    def test_dspark_normalizer_flattens_native_v4_mhc_capture(self):
+        raw = {
+            "input_ids": torch.tensor([1, 2, 3]),
+            "loss_mask": torch.ones(3, dtype=torch.long),
+            # [batch, seq, selected_layers, mHC streams, width]
+            "hidden_states": torch.arange(
+                2 * 3 * 2 * 4, dtype=torch.float32
+            ).reshape(1, 3, 2, 4, 2),
+            # Teacher hidden is captured after the target's global hc_head.
+            "target_last_hidden_states": torch.arange(
+                3 * 2, dtype=torch.float32
+            ).reshape(1, 3, 2),
+        }
+        normalize = (
+            self.registry.resolve("dspark")
+            .providers.offline_for("text")
+            .build_normalizer(3)
+        )
+
+        normalized = normalize(raw)
+
+        expected_aux = raw["hidden_states"].float().mean(dim=-2).flatten(-2)
+        expected_last = raw["target_last_hidden_states"].float()
+        torch.testing.assert_close(normalized["hidden_states"], expected_aux)
+        torch.testing.assert_close(
+            normalized["target_last_hidden_states"], expected_last
+        )
+
+    def test_dspark_normalizer_rejects_raw_v4_streams_for_teacher_hidden(self):
+        raw = {
+            "input_ids": torch.tensor([1, 2, 3]),
+            "loss_mask": torch.ones(3, dtype=torch.long),
+            "hidden_states": torch.ones(1, 3, 2, 4, 2),
+            "target_last_hidden_states": torch.ones(1, 3, 4, 2),
+        }
+        normalize = (
+            self.registry.resolve("dspark")
+            .providers.offline_for("text")
+            .build_normalizer(3)
+        )
+
+        with self.assertRaisesRegex(ValueError, "after.*hc_head"):
+            normalize(raw)
+
     def test_dspark_offline_reader_exposes_both_target_feature_sets(self):
         provider = self.registry.resolve("dspark").providers.offline_for("text")
         with tempfile.TemporaryDirectory(prefix="dspark-offline-reader-") as path:

@@ -36,6 +36,15 @@ class TemplateRegistryTest(unittest.TestCase):
         self.assertFalse(template.enable_thinking)
         self.assertEqual(template.ignore_token, ["<|end_of_msg|>"])
 
+    def test_deepseek_v4_template_matches_official_boundaries(self):
+        template = TEMPLATE_REGISTRY.get("deepseek-v4")
+
+        self.assertEqual(template.user_header, "<｜User｜>")
+        self.assertEqual(template.assistant_header, "<｜Assistant｜>")
+        self.assertEqual(template.end_of_turn_token, "<｜end▁of▁sentence｜>")
+        self.assertIsNone(template.system_prompt)
+        self.assertEqual(template.ignore_token, ["<think>", "</think>"])
+
 
 if __name__ == "__main__":
     unittest.main()

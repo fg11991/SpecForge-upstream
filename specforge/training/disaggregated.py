@@ -523,6 +523,7 @@ def _build_offline(
         resume_from=cfg.training.resume_from,
         max_checkpoints=cfg.training.max_checkpoints,
         tp_size=cfg.training.tp_size,
+        expert_parallel_size=cfg.training.expert_parallel_size,
         sp_ulysses_size=cfg.training.sp_ulysses_size,
         sp_ring_size=cfg.training.sp_ring_size,
         use_usp_preprocess=(cfg.training.attention_backend == "usp"),
