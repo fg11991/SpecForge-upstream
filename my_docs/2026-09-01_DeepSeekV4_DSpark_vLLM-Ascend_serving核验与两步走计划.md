@@ -1,411 +1,348 @@
-# DeepSeek-V4 DSpark 微调权重回灌 vLLM-Ascend：源码核验与两步走计划
+# DeepSeek-V4 DSpark 微调权重回灌 vLLM-Ascend：上机方案
 
 - 日期：2026-09-01
 - 分支：`dsv4-moe-dspark-trainable`
-- 文档编写时分支 tip：`6d2b5e5`
-- 核验对象：`fg11991/vllm-ascend`，分支 `vllm-0.27-dsv4`，commit `dedbb34`
-  （"vLLM Ascend 0.27 DeepSeek-V4 snapshot"，浅克隆只读）
-- 方法：纯静态。只读两边源码。**没有下载任何权重**，也没有上机。
-  HF 在本环境不可达（代理 403），凡是需要读 checkpoint 才能确认的事项，
-  本文只给判定命令，不给结论。
+- 核验对象：
+  - `fg11991/vllm-ascend`，分支 `vllm-0.27-dsv4`，commit `dedbb34`
+  - `fg11991/vllm`，分支 `vllm-0.27-dsv4`
+- 方法：静态读两边源码，**加上 A2 容器与共享盘上的五条实测**（§1 逐条标注）。
+- **本文取代同日初版（`68c4b64`）**。初版是纯静态推断，其中四节已被实测推翻或收窄：
+  description key 的担忧（不成立）、导出件疑似缺 expert（不成立）、
+  `architectures` 必须手改（不必要）、独立 draft 目录没有先例所以排后（应该排第一）。
+  旧版在 git 历史里。
 
 ---
 
 ## 0. 结论先行
 
-1. 外部那份"vLLM-Ascend 加载逻辑与 0731 W8A8 格式"的分析，**逐条对得上源码**，
-   数字也和我们 `compatibility_report_dsv4_dspark.md` 的独立统计精确闭合。
-2. 但它默认了一件没验证的事：`quant_model_description.json` 的 key 就是磁盘张量名。
-   vLLM-Ascend 的查表路径指向另一种命名。**如果它错了，我们的 ModelSlim warm start
-   会静默加载错权重，审计脚本也不会报**。判定命令见 §4。
-3. 微调后的 drafter 回灌有**两条**路，不是只有"重新量化"一条：把 `mtp.*` 标成
-   `FLOAT` 就能以 BF16 直接 serving，这是 vllm-ascend 对 `deepseek_mtp` 的官方做法。
-4. 因此"先 BF16 上机、再量化"的两步走成立，而且推荐：它把"训练有没有效"和
-   "量化掉不掉点"分成两个独立可判定的问题。
-5. 当前导出件有两个硬问题挡在第一步前面：单个 safetensors（疑似 expert 丢失，§5）
-   和 `architectures` 名字 vLLM 不认（§6）。
+1. **走独立 draft 目录**。`load_dspark_model` 用
+   `get_model(vllm_config=draft_vllm_config, model_config=draft_model_config)`
+   建 draft，权重从 draft 自己的路径加载——这条路是支持的，不用碰 target 目录。
+2. **导出件是完整的**，`config.json` 基本不用改：vLLM 会自己把 `architectures`
+   覆写成 `DSparkDraftModel`、`model_type` 覆写成 `deepseek_v4`。
+3. **ModelSlim warm start 是对的**：description 的 key 就是磁盘张量名（实测 7022/7022）。
+4. **剩下真正的风险不在 serving，在特征**：SGLang capture patch 里的
+   `captured.mean(dim=1)` 这个 mHC 折叠**从未与官方实现对过**。它错了的话，
+   drafter 学的是另一个目标，接受率不会好，而且和量化、和加载都无关。
+5. 次要风险：模型声明为 FP32 的 27 个参数，在导出件里只剩 3 个是 F32。
 
 ---
 
-## 1. vLLM-Ascend DSpark 加载路径：逐条核实
+## 1. 已确认的事实
 
-以下行号均指 `fg11991/vllm-ascend@dedbb34`。
+| # | 结论 | 证据 | 类型 |
+| --- | --- | --- | --- |
+| 1 | description 的 key **就是**磁盘张量名 | `mtp.*` 条目 7022，与 index 的 `mtp.*` 张量名交集 7022 | 实测 |
+| 2 | key 风格是原生 `attn`/`ffn`/`w1`，不是 `self_attn`/`mlp`/`gate_proj` | `attn style = 42`（= 3 stage × 14），`self_attn style = 0` | 实测 |
+| 3 | 导出件完整 | 2378 张量、2304 expert、38.9 GiB（= 41.8 GB）、`mtp.0.embed` 与 `mtp.2.head` 都在 | 实测 |
+| 4 | same-checkpoint DSpark 服务本来就能跑起来 | 用户在 A2 八卡上以 `--quantization ascend` + `{"method":"dspark","num_speculative_tokens":7}` 拉起过 | 实测 |
+| 5 | `/dpc/hot/x00873006/...` 与 `/sharenfs/...` 是同一份 checkpoint | 用户确认 | 实测 |
+| 6 | 独立 draft 目录被支持 | `vllm/v1/worker/gpu/spec_decode/dspark/utils.py::load_dspark_model` 用 `model_config=draft_model_config` 调 `get_model` | 源码 |
+| 7 | draft 的 `architectures` / `model_type` 由 vLLM 强制覆写 | `vllm/config/speculative.py:954-963` | 源码 |
+| 8 | 独立路径下 draft 不继承 target 量化 | `speculative.py:703` 的 `self.model is None` 分支不触发 → `self.quantization` 保持 None；`patch_dspark.py` 的 `draft_model_config.model == model_config.model` 也不成立 | 源码 |
+| 9 | drafter 会保留自己的 embed/head | `spec_decode/eagle/utils.py:12-25` 的 `_should_share`：draft 有自己的且与 target 不相等就不共享 | 源码 |
+| 10 | draft 层用 target 的 hf_config | `vllm_ascend/models/deepseek_v4/model.py:656-657` | 源码 |
+| 11 | `mtp.0` → layer 43 → `compress_ratio=0` → SWA、theta 10000、不启 yarn | `vllm_ascend/utils.py:87-100,110-115`；`model.py:519-525` | 源码 |
+| 12 | 采到的 `last_hidden_states` 是最终 RMSNorm **之后**的 | capture patch 在 `self.norm(hidden_states)` 之后返回，并显式抑制 `hidden_states_before_norm`（patch 文档第 4 条） | 源码 |
+| 13 | W8A8 条目数闭合 | 2322 × 3 = 6966 `W8A8_DYNAMIC`，加 56 `FLOAT` = 7022 | 推导+实测 |
 
-### 1.1 same-checkpoint 名字映射（成立）
+补充事实（用户提供）：训练已跑通并导出；warm start 用的就是
+`DeepSeek-V4-Flash-0731-w8a8` 里的 `mtp.*`（即 INT8 反量化的起点）；
+训练指标正常、梯度不爆、accuracy 有上升；接受率基线待测。
 
-`vllm_ascend/models/deepseek_v4/dspark.py:503-527` 的 `_remap_dspark_name`：
+---
+
+## 2. 上机方案：独立 draft 目录
+
+### 2.1 为什么能走通（完整源码链条）
 
 ```
-mtp.(\d+).(rest)  ->  model.layers.{num_hidden_layers + stage}.{rest}
+speculative_config.model = <draft 路径>          # 用户显式给出，speculative.py:703 分支不触发
+  → self.quantization 保持 None                  # 同上，不会被赋成 target 的 "ascend"
+  → draft_model_config = ModelConfig(<draft 路径>, quantization=None)
+  → speculative.py:954-963 强制 architectures = ["DSparkDraftModel"], model_type = "deepseek_v4"
+  → patch_dspark: draft_model_config.model != model_config.model → 不继承 target 量化
+  → get_draft_quant_config(vllm_config) → draft 目录里没有 quant_model_description.json
+                                          且 config.json 里没有 quantization_config → None
+  → load_dspark_model: get_model(draft_vllm_config, model_config=draft_model_config)
+  → DSparkDeepseekV4ForCausalLM 以未量化建层，从 draft 目录加载 BF16 权重
 ```
 
-外加四类特例：
+三个 DSpark 层仍然由 **target 的 hf_config** 构造（`model.py:656-657`），
+所以 `compress_ratios` / `num_hash_layers` / `index_topk_*` / `compress_rope_theta`
+这些 draft config 里没有的字段自动从 target 来，不用补、不用软链。
+tokenizer 同理，走 target 的。
 
-| 磁盘名 | 运行时名 |
-| --- | --- |
-| `mtp.*.main_proj` / `main_norm` | 固定归 `layers.43` |
-| `mtp.*.norm` / `markov_head.*` | 固定归 `layers.45` |
-| `mtp.*.confidence_head.*`、`hc_head_{fn,base,scale}` | 提到 `model.*` |
-| `mtp.0.embed.weight` / `mtp.2.head.weight` | `model.embed_tokens.weight` / `lm_head.weight` |
+### 2.2 draft 目录该长什么样
 
-随后做子串替换 `.attn.→.self_attn.`、`.ffn.→.mlp.`、`.w1/.w2/.w3→.gate_proj/.down_proj/.up_proj`、
-`.mlp.gate.bias→.mlp.gate.e_score_correction_bias`。
+**两个文件，就这两个：**
 
-**对我们的意义：SpecForge 导出的原始命名（`mtp.0.attn.wq_a.weight`、
-`mtp.0.ffn.experts.7.w1.weight`）正是它要吃的形式，不需要在导出侧改名。**
-
-### 1.2 关键机制：draft 层用的是 target 的 hf_config
-
-`dspark.py:139-146` 构造三个 stage：
-
-```python
-str(self.mtp_start_layer_idx + idx): DeepseekV2DecoderLayer(
-    vllm_config, prefix=f"mtp.{idx}", is_draft_layer=True,
-)
+```
+deepseek-v4-flash-dspark-export/
+├── config.json
+└── model.safetensors      # 2378 张量、38.9 GiB
 ```
 
-`config` 参数缺省，`models/deepseek_v4/model.py:656-657` 回落到
-`vllm_config.model_config.hf_config` —— **target 的配置**。只有
-`DeepseekV4DSparkModel.__init__`（`dspark.py:122`）读
-`speculative_config.draft_model_config.hf_config`。
+> **绝对不要把 target 的 `quant_model_description.json` 软链进来。**
+> `vllm_ascend/quantization/utils.py:165` 判定"是不是 ModelSlim 模型"的唯一依据
+> 就是这个文件存不存在。链进去等于声明这个 BF16 draft 是量化的，
+> 然后拿 target 的标签去查我们的 BF16 权重。
 
-推论（对导出侧很重要）：
-
-- `compress_ratios`、`num_hash_layers`、`index_topk_*`、`compress_rope_theta`
-  这些 draft config 里没有的字段**不需要补**，它们从 target 来；
-- draft config 只需提供 DSpark 级字段，清单见 §6。
-
-另注意 `dspark.py:139` 的 `prefix=f"mtp.{idx}"` 与 ModuleDict 的 key `str(43+idx)`
-是**两套命名**：参数树是 `model.layers.43.*`，而量化查表用的 prefix 是 `mtp.0.*`。
-这是故意的，§4 依赖这一点。
-
-### 1.3 RoPE 不会走错（好消息）
-
-`vllm_ascend/utils.py:87-100` `extract_dsv4_layer_index` 把 `mtp.0` 映射成
-`num_hidden_layers + 0 = 43`；`utils.py:110-115` `get_dsv4_compress_ratio` 对
-超出 `compress_ratios` 长度的层返回 0（注释原文："treating unspecified MTP
-layers as dense"）。`model.py:519-521,525` 因此走 `compress_ratio == 0` 分支：
-SWA、`rope_parameters["rope_theta"] = config.rope_theta`，不启 yarn。
-
-**与我们 `DeepseekV4DSparkAttention` 硬编码 `rope_scaling = None`、theta 10000
-的训练假设一致。** 导出 config 里那两坨 yarn 字段是死字段，不会被 draft 层读到。
-
-### 1.4 draft 继承 target 量化配置的补丁（成立）
-
-`vllm_ascend/patch/worker/patch_v2/patch_dspark.py`：判据是
-
-```python
-inherits_target_quant = draft_model_config.model == vllm_config.model_config.model
-```
-
-命中就把 `model_utils.get_draft_quant_config` 临时换成返回 `vllm_config.quant_config`，
-`finally` 里还原。由 `patch/worker/__init__.py:70` **无条件 import**。
-不打补丁的失败模式是 KeyError（draft linear 缺 `weight_scale`/`weight_offset`/
-`scale_bias`），不是静默。
-
-**反向推论**：draft 路径与 target 路径不同时，这个补丁不生效，draft 按未量化建层
-—— 这正是 §7 路 1a 想要的。
-
-### 1.5 `VLLM_ASCEND_APPLY_DSV4_PATCH` 是空转的
-
-全仓 grep 该变量 **0 命中**，`vllm_ascend/envs.py` 里也没有。这个分支无条件导入
-DSpark patch。启动脚本里那行 export 不起任何作用（旧镜像遗留或私有补丁开关）。
-
-> 但这只证明**这份源码**不读它。容器里装的是不是这份代码要另行确认：
-> `python -c "import vllm_ascend, os; print(os.path.dirname(vllm_ascend.__file__))"`
-> 然后比对 `patch/worker/patch_v2/patch_dspark.py` 是否存在及内容。
-
-### 1.6 官方用法全是 same-checkpoint
-
-`docs/source/tutorials/models/DeepSeek-V4-Flash.md` 与
-`tests/e2e/pull_request/four_card/spec_decode/test_dspark_deepseekv4.py` 里的
-speculative config 一律是
+`config.json` 建议改两个字段——vLLM 反正会覆写 `architectures`，但覆写发生在
+`ModelConfig` 构造**之后**，写对了可以避免构造阶段就在注册表里查不到：
 
 ```json
-{"method": "dspark", "num_speculative_tokens": 7, "enforce_eager": true}
+"architectures": ["DSparkDraftModel"],
+"n_mtp_layers": 3
 ```
 
-不带独立 draft 路径；e2e 用的权重是 `DeepSeek-V4-Flash-DSpark-w4a8-test`。
-**独立 draft 目录属于没有先例的走法**，§7 据此排优先级。
+`n_mtp_layers` 是 `vllm_ascend/models/deepseek_v4/dspark.py:65-69` 的首选字段
+（其次 `dspark_num_mtp_layers`，再默认 3）。我们导出的是 `dspark_num_layers`，
+目前靠默认值蒙对，写死更稳。其余字段保持原样，包括那两坨 yarn 参数
+（是死字段，draft 层读的是 target config）。
 
----
+### 2.3 启动命令
 
-## 2. ModelSlim W8A8 数量核对（闭合）
+在你已经跑通的那条上加一个 `"model"`：
 
-用官方 FP4/FP8 checkpoint 的统计（`compatibility_report_dsv4_dspark.md` §1）反推
-W8A8 版本的条目数：
+```bash
+DRAFT=/sharenfs/w00958190/dsv4-dspark/0901_export/deepseek-v4-flash-dspark-export
 
-| 量 | 推导 | 外部说法 |
-| --- | --- | ---: |
-| 每 stage 待量化矩阵 | 256×3 experts + shared_experts 3 + `wq_a/wq_b/wkv` 3 = 774 | — |
-| 三 stage 合计 | 2322 | — |
-| `W8A8_DYNAMIC` 条目 | 2322 ×（weight + weight_scale + weight_offset）= **6966** | 6966 |
-| `FLOAT` 条目 | 官方 2376 权重 − 2322 = 54，加 `mtp.0.embed`/`mtp.2.head` = **56** | 56 |
-| `mtp.*` 合计 | **7022** | 7022 |
+vllm serve /dpc/hot/x00873006/DeepSeek-V4-Flash-0731-w8a8 \
+    --max-model-len 133072 \
+    --max-num-batched-tokens 8192 \
+    --served-model-name dsv4 \
+    --gpu-memory-utilization 0.9 \
+    --max-num-seqs 32 \
+    --data-parallel-size 1 \
+    --tensor-parallel-size 8 \
+    --enable-expert-parallel \
+    --tokenizer-mode deepseek_v4 \
+    --tool-call-parser deepseek_v4 \
+    --enable-auto-tool-choice \
+    --reasoning-parser deepseek_v4 \
+    --no-enable-prefix-caching \
+    --no-disable-hybrid-kv-cache-manager \
+    --model-loader-extra-config='{"enable_multithread_load": true, "num_threads": 128}' \
+    --quantization ascend \
+    --port 8900 \
+    --block-size 128 \
+    --speculative-config "{\"method\":\"dspark\",\"model\":\"$DRAFT\",\"num_speculative_tokens\":7,\"enforce_eager\":true}" \
+    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
+```
 
-官方侧同样闭合：FP4 2304 + FP8 25 = 2329 个 scale，与 4705 = 2376 + 2329 一致。
+`--quantization ascend` 只作用于 target 的 ModelConfig；draft 的量化由
+`speculative_config.quantization` 决定，不给就是 None。
 
-量化形式（对称 per-output-channel INT8、`scale` 形状 `[out,1]`、offset 恒 0）
-与本仓库 `deepseek_v4_dspark.py:1102-1130` 的实现一致，三条独立证据见
-`my_docs/2026-08-18_..._A3穿刺与A2上机手册.md` §2.9。"权重行 min=-127、无 -128"
-对加载方向无影响，但对**重新量化导出**是硬约束（必须 clamp 到 ±127）。
+**显存**：BF16 drafter 在 EP8 下约 5 GB/rank，比 same-checkpoint 的 W8A8 版本多约
+2.5 GB/rank。target 权重实测 36.99 GB/rank，卡上原有约 23.8 GB 余量，放得下，
+但 `--gpu-memory-utilization 0.9` 下 KV 池会相应变小。
 
----
+### 2.4 embed / head 的归属
 
-## 3. 本仓库当前能力边界
-
-- **已有**：官方 FP4/FP8 与 ModelSlim W8A8 两种 warm start
-  （`deepseek_v4_dspark.py::load_official_checkpoint`）、权重审计脚本、
-  Ascend EP 训练、HF/SGLang draft 导出。
-- **没有**：把训练完的 `mtp.*` 写回 fused checkpoint、重新量化、写 description。
-  开发文档 §6.3 与 §10 第 5 条已声明这是"下一阶段 serving adapter"。
-
-本文讨论的正是这块空白。
-
----
-
-## 4. 未决项（最高优先级）：description 的 key 命名
-
-我们的 loader（`deepseek_v4_dspark.py:1569`）这样查标签：
+`load_dspark_model` 在建完 draft 后会决定是否让 draft 共享 target 的 embedding/head：
 
 ```python
-label = quant_description.get(checkpoint_name)   # checkpoint_name = 磁盘张量名
+# spec_decode/eagle/utils.py:12-25
+def _should_share(eagle, flag, draft, target):
+    if not getattr(eagle, flag, False) or draft is None:
+        return True            # draft 没有自己的 → 共享 target 的
+    if target is None:
+        return False
+    return torch.equal(draft.weight, target.weight)   # 相等才共享
 ```
 
-**隐含假设：description 的 key 与 safetensors 张量名逐字相同。**
+`flag` 由加载时的 `process_eagle_weight` 置位（`vllm/model_executor/models/utils.py:1028-1047`）：
+权重名里带 `embed_tokens` / `lm_head` 就置 True。我们的 `mtp.0.embed.weight` 和
+`mtp.2.head.weight` 经 `_remap_dspark_name` 正好变成这两个名字，而且数值与 target 的
+不相等（compat report：差异分别达 3.7 和 4.4），所以 **drafter 会保留自己的 embed 和 head**
+——这正是 `642c237` 想要的行为。
 
-而 vLLM-Ascend 侧：模块 prefix 是 `mtp.0.self_attn.wq_a` /
-`mtp.0.mlp.experts.0.gate_proj`（`model.py:474-516,672-686`），
-`quantization/configs/modelslim_config.py:736-742` 又把
-`QUANT_MODEL_SUBSTR_MAPPINGS["deepseek_v4"]`（`.attn.→.self_attn.`、
-`.w1.→.gate_proj.`、`.ffn.→.mlp.`）**作用在 prefix 上**（方向是原始名→vLLM 名），
-而 `models/deepseek_v4/` 下没有定义 `hf_to_vllm_mapper`，description 的 key
-不会被规范化。两边要对上，description 的 key 就得是 `self_attn/mlp/gate_proj` 风格。
-
-后果不对称：
-
-- **vLLM-Ascend 侧会响**：非 fused 层 `create_scheme_for_layer` 查不到；
-  fused 层 `is_layer_skipped_ascend`（`modelslim_config.py:854`）直接 KeyError。
-- **我们训练侧是哑的**：`quant_description.get()` 全返回 `None` → 走 FLOAT 分支 →
-  找不到 `weight_scale_inv` → **把 INT8 原样 copy 进 BF16 参数，shape 检查还能过，
-  不报任何错**。
-- **审计脚本也是哑的**：`scripts/audit_deepseek_v4_dspark_checkpoint.py:340-345`
-  是拿 description 的 key 去过滤实际张量的，对不上就返回空列表，
-  而空列表在退出码判定（`:528-531`）里不算失败。
-
-### 判定命令（在有 checkpoint 的机器上跑）
+### 2.5 判据
 
 ```bash
-python - <<'EOF'
-import json
-root = '/sharenfs/DeepSeek-V4-Flash-0731-w8a8'
-d = json.load(open(f'{root}/quant_model_description.json'))
-ks = [k for k in d if k.startswith('mtp.')]
-print('mtp entries      :', len(ks), '(期望 7022)')
-print('sample           :', ks[:6])
-print('self_attn style  :', sum('.self_attn.' in k for k in ks))
-print('attn style       :', sum('.attn.' in k and '.self_attn.' not in k for k in ks))
-idx = json.load(open(f'{root}/quant_model_weights.safetensors.index.json'))['weight_map']
-print('key == tensor 名 :', len(set(ks) & {k for k in idx if k.startswith('mtp.')}), '(期望 7022)')
-EOF
+curl -s localhost:8900/metrics | grep -E "spec_decode_num_drafts|spec_decode_num_accepted_tokens_per_pos"
 ```
 
-最后一行是判据：**等于 7022 → 现有代码是对的；等于 0 → 那条 ModelSlim 路径从未
-真正生效，所有以它 warm start 的训练结果都要作废重跑。**
-
-不论结果如何，都应补两处防护：
-
-1. loader：description 存在但 `mtp.*` 一个 key 都没命中时报错，并打印实际 key 样例；
-   同时加一层 key 规范化（`attn↔self_attn`、`ffn↔mlp`、`w1/w2/w3↔gate_proj/up_proj/down_proj`
-   双向尝试），命中哪种打一行日志。
-2. 审计脚本：`checkpoint_format == "modelslim"` 且 `quantized_samples` 为空 → 判失败。
+和**同一组 prompt、同样 `num_speculative_tokens`** 下 same-checkpoint 官方 drafter
+的数字比。官方 e2e 的 golden 参考值（`tests/e2e/.../test_dspark_deepseekv4.py`，
+w4a8 权重、TP4）是 `[0.88, 0.74, 0.58, 0.49, 0.40, 0.30, 0.18]`，
+但**不要拿它当基线**——权重、并行度、prompt 都不同。基线必须是你自己那台机器上
+官方 drafter 的实测值。
 
 ---
 
-## 5. 导出件核验：单个 safetensors 是可疑的
+## 3. 备用方案：same-checkpoint 覆盖
 
-BF16 三阶段 DSpark ≈ **19.85 B 参数 ≈ 39.7 GB**，加上模型自带的
-`mtp.0.embed` + `mtp.2.head`（各 129280×4096 BF16 ≈ 1.06 GB）≈ **41.8 GB**。
-`save_pretrained` 默认 `max_shard_size="5GB"`，正常应产出约 9 个分片 + index.json。
+独立目录走不通时才用。实测的分片布局（`quant_model_weights.safetensors.index.json`）：
 
-只有一个文件，除非显式改过 `max_shard_size`，否则最可能是
-**EP 的 expert 权重没被合并进来**：`training/controller.py:899-903` 把
-`.ffn.experts.` 的张量单独写进各 rank 的 rank file，只有
-`export/checkpoint_io.py:150-160` 的 `_consolidate_export_state` 在
-`expert_parallel_size > 1` 时才会拼回来。
+| 分片 | mtp 张量 | 非 mtp 张量 |
+| --- | ---: | ---: |
+| `-00068-of-00074` | 1306 | **185** |
+| `-00069-of-00074` | 1080 | 0 |
+| `-00070-of-00074` | 1530 | 0 |
+| `-00071-of-00074` | 1494 | 0 |
+| `-00072-of-00074` | 1530 | 0 |
+| `-00073-of-00074` | 82 | **5** |
+
+合计 7022 ✓。**00068 和 00073 是混合分片**，这条路因此比想象中麻烦：
+
+vLLM 用 index 决定加载哪些**文件**，但对选中的文件是遍历里面**所有**张量。
+所以这两个文件只要还被 index 引用（它们含非 mtp 张量，必须引用），
+里面的旧 INT8 `mtp.*` 就会被一起读出来，和新的 BF16 撞名。
+**这两个分片必须物理重写**（读出、剔掉 `mtp.*`、重新 `save_file`），
+只改 index 不够。
+
+其余步骤：新目录里软链 target 全部文件 → `rm` 掉要改写的软链（**不 `rm` 直接写会穿透
+到原始 294 GB checkpoint**）→ 挂上我们的 BF16 分片 → 重写 index（`mtp.*` 指向新分片）
+→ 重写 description（删掉旧的 7022 条 `mtp.*`，按**同样的 key 风格**写入 2378 条 `FLOAT`）。
+config.json 用 target 的，我们导出的那个在这条路上完全用不上。
+
+`FLOAT` 标签会让 `is_layer_skipped_ascend`（`modelslim_config.py:834-871`）
+返回未量化的 method。这也是 vllm-ascend 自己对 `deepseek_mtp` 的做法
+（`modelslim_config.py:176-178` 的 NOTE：msmodelslim 不生成 MTP 层信息，请手工设为 FLOAT）。
+
+---
+
+## 4. 真正的风险清单（按影响排序）
+
+### 4.1 mHC 折叠 `mean(dim=1)` 从未对过官方实现 —— 最高
+
+`patches/sglang/v0.5.14/apply_deepseek_v4_capture.py` 自己写着：
+
+> NOT VERIFIED HERE: that `captured.mean(dim=1)` is the fold the official V4
+> DSpark drafter consumes. It matches SpecForge's normalizer
+> (`_project_target_hidden`, which does `mean(dim=-2)`), but the mHC stream mean
+> is not the same operation as the learned `hc_head` fold.
+
+采集侧把 `[T, hc_mult, H]` 的多流状态按 `mean` 折成 `[T, H]`，而官方 drafter 消费的
+可能是 `hc_head` 学出来的加权折叠。**两者不同的话，drafter 训练时看到的 target 特征
+和 serving 时 vLLM 喂给它的不是同一个东西**，接受率不会好，且这个失配在训练指标上
+看不出来（loss 会正常下降，只是在拟合一个错的目标）。
+
+排查方式：拿官方 `inference/model.py` 的 `hc_head` 前向，和 capture 出来的
+`mean(dim=1)` 在同一批输入上比数值。这件事**应该在花力气做 serving 之前做**，
+因为它决定这个 drafter 值不值得上机。
+
+### 4.2 27 个 FP32 参数在导出件里只剩 3 个 —— 高
+
+模型显式声明为 FP32 的参数刚好 27 个，与官方 checkpoint 的 F32 计数一致：
+
+| 参数 | 数量 | 声明处（`deepseek_v4_dspark.py`） |
+| --- | ---: | --- |
+| `attn_sink` | 3 | `:370` |
+| `gate.bias`（router correction bias） | 3 | `:621-625` |
+| `hc_attn_{fn,base,scale}` | 9 | `:889-894` |
+| `hc_ffn_{fn,base,scale}` | 9 | `:896-901` |
+| `hc_head_{fn,base,scale}` | 3 | `:928-933` |
+
+导出件实测 `Counter({'BF16': 2375, 'F32': 3})`。vLLM-Ascend 那边同样声明为 FP32
+（`model.py:697-700`、`model.py:473`、`dspark.py:357-367`），加载时 `copy_` 会自动升回
+FP32，不报错，但精度已经在导出时丢了。
+
+最担心 `gate.bias`：`noaux_tc` 用它和 routed score 相加后选 top-6，
+而 `router_bias_update_rate = 0.001` 的更新量在 BF16（8 位尾数）下很可能整个被舍掉
+——**如果训练时它就是 BF16，那 router 的负载均衡在整个训练过程里可能都没生效**。
+
+定位（两条，先跑第二条）：
 
 ```bash
+# 导出件里哪 3 个还是 F32
 python - <<'EOF'
-import json, struct, collections, glob
-p = sorted(glob.glob('*.safetensors'))[0]
-with open(p,'rb') as f:
-    n = struct.unpack('<Q', f.read(8))[0]
-    hdr = json.loads(f.read(n))
+import json, struct
+with open('model.safetensors','rb') as f:
+    n = struct.unpack('<Q', f.read(8))[0]; hdr = json.loads(f.read(n))
 hdr.pop('__metadata__', None)
-size = sum(v['data_offsets'][1]-v['data_offsets'][0] for v in hdr.values())
-print('file       :', p)
-print('tensors    :', len(hdr), '(期望 2378)')
-print('experts    :', sum(1 for k in hdr if '.ffn.experts.' in k), '(期望 2304)')
-print('bytes      : %.1f GiB (期望 ~41.8)' % (size/2**30))
-print('dtypes     :', collections.Counter(v['dtype'] for v in hdr.values()))
-print('embed/head :', [k for k in hdr if k.endswith(('embed.weight','head.weight'))])
+print('F32 :', [k for k,v in hdr.items() if v['dtype']=='F32'])
+for pat in ('attn_sink','gate.bias','hc_attn_fn','hc_head_fn'):
+    print(pat, ':', {v['dtype'] for k,v in hdr.items() if pat in k})
+EOF
+
+# 训练 checkpoint 里它们是什么 dtype —— 决定是训练掉的还是导出掉的
+python - <<'EOF'
+import torch
+s = torch.load('<checkpoint>/training_state.pt', map_location='cpu', weights_only=False)
+d = s['draft_state_dict']
+for pat in ('attn_sink','gate.bias','hc_attn_fn','hc_head_fn'):
+    print(pat, ':', {v.dtype for k,v in d.items() if pat in k})
 EOF
 ```
 
-`experts` 不是 2304 就先修导出，别往下走。
+- 训练 checkpoint 里是 FP32 → 只是导出时被 `export/checkpoint_io.py:179` 的
+  `torch_dtype=torch.bfloat16` 一刀切了，改导出即可（保留声明为 FP32 的参数）。
+- 训练 checkpoint 里就是 BF16 → 训练阶段掉的，要回去看 backend 的 dtype 处理，
+  而且 4.1 之外又多一个"训练本身是否有效"的疑点。
+
+### 4.3 没有接受率基线 —— 中
+
+官方 drafter 在**同一台机器、同一组 prompt**下的接受率还没测。
+没有它，第一步做完也无法判断成败。这件事和上机是同一次服务的两趟跑，成本很低。
+
+### 4.4 第二步的量化 —— 低
+
+见 §5。收益是显存/带宽，不是精度，晚做没有损失。
 
 ---
 
-## 6. 导出 config.json 字段对照
+## 5. 第二步：量化
 
-按 §1.2，draft config 只需提供 DSpark 级字段：
-
-| vLLM-Ascend 读取处 | 字段 | 当前导出 | 判定 |
-| --- | --- | --- | --- |
-| `dspark.py:129` | `num_hidden_layers` → `mtp_start_layer_idx` | 43 | ✅ 必须保持 43，不能写成 3 |
-| `dspark.py:123-127,176-178` | `hc_mult` / `hc_eps` / `rms_norm_eps` / `hidden_size` / `vocab_size` | 有 | ✅ |
-| `dspark.py:126-127` | `dspark_block_size` / `dspark_target_layer_ids` | 5 / [40,41,42] | ✅ |
-| `patch_speculative_config.py:46-47` | `dspark_noise_token_id` → `ptd_token_id` | 128799 | ✅ 自动补 |
-| `dspark.py:65-69` | `n_mtp_layers`，其次 `dspark_num_mtp_layers`，再默认 3 | 只有 `dspark_num_layers` | ⚠️ 靠默认值蒙对，应显式写 `n_mtp_layers: 3` |
-| `models/__init__.py:39-42` | `architectures` | `DeepseekV4DSparkDraftModel` | ❌ **注册名是 `DSparkDraftModel`**，现名 vLLM 找不到模型 |
-| `modelslim_config.py:383,724` | `model_type`（决定 packed/substr 映射） | `deepseek_v4_dspark` | ⚠️ 表里只有 `deepseek_v4`；走 FLOAT 路无影响，走 W8A8 时要改或补映射 |
-
-`architectures` 与 `n_mtp_layers` 建议改在 `DeepseekV4DSparkConfig` 的导出侧，
-而不是手工改 json。
-
-> 命名先例：`patch_speculative_config.py:28` 对 qwen3 dspark 的判据也是
-> `"DSparkDraftModel" in architectures`，说明这是该分支统一的 draft 架构名。
-
----
-
-## 7. 两步走方案
-
-### 为什么分两步
-
-- 第一步（BF16）验的是**训练本身有没有效**：接受率相对官方 drafter 涨了没有。
-- 第二步（量化）验的是**量化掉了多少点**。
-- 合在一起做，接受率不及预期时无法区分是训练没学到东西还是量化砸了。
-- 量化的收益是显存/带宽而非精度，晚做没有损失。
-
-**注意精度名称**：导出是 **BF16**（`checkpoint_io.py:179` `torch_dtype=torch.bfloat16`，
-config `dtype: bfloat16`），不是 FP16，且必须保持 BF16 —— 启动配方里有
-`INF_NAN_MODE_FORCE_DISABLE=1`，FP16 溢出不会报错，只会悄悄出 NaN。
-
-### 第一步的两条子路
-
-**路 1a：独立 draft 目录（首选）**
+独立 draft 目录让第二步比原计划干净：**把 description 放进 draft 目录自己**，
+不用碰 target。
 
 ```
---speculative-config '{"method":"dspark","model":"/path/to/bf16-draft",
-                       "num_speculative_tokens":7,"enforce_eager":true}'
+deepseek-v4-flash-dspark-export-w8a8/
+├── config.json
+├── quant_model_weights.safetensors      # INT8 + weight_scale + weight_offset
+├── quant_model_weights.safetensors.index.json
+└── quant_model_description.json          # 2322×3 条 W8A8_DYNAMIC + 其余 FLOAT
 ```
 
-好处：draft 路径 ≠ target 路径 → §1.4 的补丁不生效 → draft 按未量化建层 →
-BF16 直接加载，description 一个字都不用动。且我们的模型自带
-`mtp.0.embed` / `mtp.2.head`（`deepseek_v4_dspark.py:902-925`，`642c237` 引入），
-经 §1.1 的映射正好落到 draft 自己的 `embed_tokens` / `lm_head`
-（`dspark.py:131,323`），**目录是自洽的，不需要额外注入 embedding**。
+`get_draft_quant_config` 会走 `VllmConfig.get_quantization_config(draft_model_config, ...)`，
+draft 目录里有 description 就被识别为 ModelSlim（`quantization/utils.py:165`）。
+启动时给 `--speculative-config` 加 `"quantization":"ascend"`。
 
-能否走通取决于上游一个函数，容器里一条命令可判：
+量化规格（与 target 一致，实测确认）：
 
-```bash
-python -c "import vllm.v1.worker.gpu.spec_decode.dspark.utils as u, inspect; \
-print(inspect.getsource(u.load_dspark_model))"
-```
+- 只量化那 774×3 = 2322 个矩阵（experts w1/w2/w3、shared_experts w1/w2/w3、
+  attn wq_a/wq_b/wkv），其余标 `FLOAT`；
+- per-output-channel 对称 INT8，`scale = absmax/127` 存 FP32 `[out,1]`，
+  `offset` 全零，权重 clamp 到 **±127**（官方权重实测无 -128）；
+- key 风格用**原生命名**（`mtp.0.attn.wq_a.weight`），与 target 的 description 一致。
 
-看它是从 `draft_model_config` 取 loader，还是硬用 target 的权重迭代器。
-前者 → 1a 可行；后者 → 走 1b。考虑到 §1.6（官方用法全是 same-checkpoint），
-1a 失败是正常结果，不要在上面耗太久。
-
-**路 1b：覆盖回 target 目录（一定能通）**
-
-把 BF16 的 `mtp.*` 写成新分片放进 target 目录、更新 index，并把
-`quant_model_description.json` 里所有 `mtp.*` 条目标成 `FLOAT`。
-`is_layer_skipped_ascend`（`modelslim_config.py:834-871`）见到 FLOAT 就返回
-`AscendUnquantizedLinearMethod` / `AscendUnquantizedFusedMoEMethod`，BF16 正常加载。
-
-这正是 vllm-ascend 自己对 `deepseek_mtp` 的官方做法，见
-`modelslim_config.py:176-178` 的注释原文：
-
-> NOTE 1. The quantized MTP layer of deepseek on the NPU is not quantized;
-> NOTE 2. The description file generated by the current msmodelslim tool does not
-> have MTP layer info. Please manually add it and set the value to FLOAT.
-
-对照：SGLang 侧配方里的 `FORCE_DRAFT_MODEL_NON_QUANT=1` 是同一件事。
-
-实施注意：用软链接建一个新目录，只把改动的分片和 description 落到新目录，
-不要污染原始 target 权重；备份 `ori_quant_model_description.json`
-（`examples/save_sharded_state_310.py:252` 就是这个约定）。
-
-### 显存
-
-BF16 drafter 在 EP8 下约 **5 GB/rank**，比 W8A8 多约 2.5 GB/rank。
-实测 target 权重 36.99 GB/rank、卡上尚空 23.8 GB，放得下。
-
-### 第二步（量化）
-
-`specforge/export/to_vllm_ascend_dspark.py`，`--draft-precision {float,w8a8}`：
-
-- 合并 EP rank-local experts → 完整 `mtp.*`（复用 `materialize_draft`）；
-- `float`：写 BF16 `mtp.*`，description 中 `mtp.*` 全标 FLOAT；
-- `w8a8`：只量化 §2 那 774×3 个矩阵，其余保持 FLOAT；
-  `scale = absmax/127` FP32 `[out,1]`、`offset` 全零、权重 clamp ±127 存 INT8；
-- **key 风格跟随现有文件**：读入原 description，学它的命名风格再写 `mtp.*` 条目，
-  这样 §4 的结论无论是哪个都不会写错；
-- 自校验：导出后跑审计脚本；再用 `load_official_checkpoint` 读回，
-  与训练态 BF16 比相对误差（float 路应为 0，w8a8 路期望 1e-2 量级）。
+自校验：导出后跑 `scripts/audit_deepseek_v4_dspark_checkpoint.py`；
+再用 `load_official_checkpoint` 读回，与训练态 BF16 比相对误差。
 
 ---
 
-## 8. 两个待堵的静默口子
+## 6. 待办
 
-1. **`materialize_draft` 对任何含 "embed" 的缺失键一律容忍**
-   （`export/checkpoint_io.py:187-191`），而 `export_to_hf` 那条"缺 embedding 就报错"
-   的守卫判的是 `hasattr(model, "embed_tokens")`（`to_hf.py:91`）——
-   我们的名字是 `mtp.0.embed`，**这个守卫对 DSpark 根本不触发**。
-   目前因为 `DSparkTrainStrategy.checkpoint_state_filter` 保留了全部
-   `draft_model.*`（含冻结的 embed/head），实际没出事，但这是个一改就中的雷。
-2. §4 的 description key 防护（loader + 审计脚本各一处）。
+**先做（不上机）**
 
-另：`my_docs/2026-08-18_..._A3穿刺与A2上机手册.md` §2.9 中"审计报告的
-`unexpected: [mtp.0.embed.weight, mtp.2.head.weight]` 是预期的"一句已过时 ——
-`642c237` 之后模型自己声明了这两个张量，`unexpected` 应为空。
+1. 4.1 的 mHC 折叠数值比对。**这是决定 drafter 值不值得上机的那一条。**
+2. 4.2 的两条 dtype 诊断。
+3. 导出侧写死 `architectures: ["DSparkDraftModel"]` 和 `n_mtp_layers: 3`
+   （改在 `DeepseekV4DSparkConfig`，不要手改 json）。
 
----
+**上机（一次服务跑两趟）**
 
-## 9. 行动清单
+4. 先跑官方 drafter（same-checkpoint），记下接受率——这是基线。
+5. 再跑 §2.3 的命令，比同一组 prompt 的接受率。
 
-**Step 0（不写代码，先做）**
+**之后**
 
-1. 跑 §5 的 header 检查，确认导出件完整（`experts == 2304`）。
-2. 跑 §7 的 `inspect.getsource(load_dspark_model)`，定 1a / 1b。
-3. 跑 §4 的判定命令，定 description key 命名。
-   —— 只影响第二步和 warm start 正确性，**不挡第一步**。
-4. 确认容器里的 `vllm_ascend` 是否就是 `dedbb34`（§1.5）。
-5. 确认最终部署形态是 W8A8 还是 W4A8_MXFP。我们的 loader 遇到 MXFP 标签是报错
-   而非猜（`deepseek_v4_dspark.py:1570-1576`），若目标是 W4A8 则读写两侧都要新增支持。
-
-**Step 1（BF16 上机）**
-
-1. 修 `architectures` → `["DSparkDraftModel"]`，加 `n_mtp_layers: 3`（改在导出侧）。
-2. 按 1a 或 1b 起服务。
-3. 判据：`vllm:spec_decode_num_accepted_tokens_per_pos` 与官方 drafter 的 golden
-   `[0.88, 0.74, 0.58, 0.49, 0.40, 0.30, 0.18]`（e2e 测试里的数）对比。
-   不低于 → 训练链路成立；明显低 → 是训练/特征问题，不要去怪量化。
-
-**Step 2（量化）**：Step 1 通过后按 §7 末节实施。
-
-**贯穿**：Step 1 之前把 §8 两个静默口子堵上。
+6. §5 的量化导出器。
 
 ---
 
-## 10. 本文没有验证的东西
+## 7. 本文没有验证的
 
-诚实边界，避免后来者误读：
-
-1. `quant_model_description.json` 的实际 key 命名（HF 不可达，§4 是判定方法不是结论）。
-2. 上游 `load_dspark_model` 是否支持独立 draft 路径（本环境未安装 vllm）。
-3. 容器内实际安装的 `vllm_ascend` 是否等于 `dedbb34`。
-4. 任何真机数值：接受率、显存、吞吐一律未测。
-5. 上机总闸门 `custom_ops` 缺件（见 2026-08-18 手册 §1）仍未解决，与本文这条线
-   相互独立，但它不通则 Step 1 无从谈起。
+1. §2 那条独立 draft 目录的启动命令**没有实跑过**。源码链条是通的，但
+   `ModelConfig` 构造阶段、KV cache 分配、`dspark_head` 的 compile tag 这些
+   都可能有没读到的分支。
+2. 接受率、显存、吞吐一律未测。
+3. `captured.mean(dim=1)` 的正确性（这正是 4.1）。
+4. 容器里实际安装的 `vllm_ascend` 是否逐字等于 `dedbb34`。用户确认用的是
+   `fg11991/vllm-ascend@vllm-0.27-dsv4` 和 `fg11991/vllm@vllm-0.27-dsv4`，
+   本文按此为准；但启动脚本里的 `VLLM_ASCEND_APPLY_DSV4_PATCH=1` 在这两个仓库里
+   都搜不到读取处，该变量应为空转（DSpark patch 由
+   `vllm_ascend/patch/worker/__init__.py:70` 无条件导入）。
