@@ -21,8 +21,10 @@
 2. **导出件是完整的**，但 `config.json` 必须改三个字段，其中 `model_type` 是硬性的
    ——vLLM 那段自动覆写发生在 `ModelConfig` 构造之后，救不了构造阶段的解析失败（§2.2，实测）。
 3. **ModelSlim warm start 是对的**：description 的 key 就是磁盘张量名（实测 7022/7022）。
-4. **首次上机跑通了，但接受率 4.6%，官方基线是 88%**（§5）。特征契约已逐行排除
-   （§4.1），嫌疑集中在 warm start 是否真的生效、以及 100 步训练是否把它训坏了。
+4. **首次上机跑通了，但接受率 4.6%（官方 golden 0.88）**（§5）。特征契约（§4.1）、
+   warm start、学习率**全部排除**——导出件与官方权重的 median cosine 是 0.99988，
+   这个 drafter 实质上就是官方 drafter。所以问题在 serving 路径，
+   即"独立 draft 目录"与 same-checkpoint 两种模式的差异（§5.5）。
 5. 次要风险已定性：声明为 FP32 的 27 个参数里，24 个在**训练全程**就是 BF16
    （FSDP1 的 flat-param 约束所致），但运算全程上采、`gate.bias` 已被单独保住，serving 无影响（§4.2）。
 
@@ -48,6 +50,8 @@
 | 14 | 训练与 serving 的 aux 特征契约**完全一致**（层 40/41/42 的输出、`mean(dim=1)` 折叠、`main_norm(main_proj)`） | 见 §4.1 的逐项对照 | 源码 |
 | 15 | 独立 draft 目录能真正拉起服务 | 2026-09-02 在 A2 八卡上起来了，`--speculative-config` 带 `"model"` | 实测 |
 | 16 | 该 drafter 的接受率 pos0 = 4.6%（20/439），pos1-6 全 0 | `/metrics`，见 §5 | 实测 |
+| 17 | 导出件与官方 `mtp.*` 的 median cosine = 0.99988（min 0.95958） | `compare_draft_to_official.py` | 实测 |
+| 18 | BF16 draft 的线性/MoE 层**不受** vLLM"未初始化权重"检查保护 | `default_loader.py:455-465` 对有 `process_weights_after_loading` 的模块跳过检查；两个 Unquantized method 都有 | 源码 |
 
 补充事实（用户提供）：训练已跑通并导出；warm start 用的就是
 `DeepSeek-V4-Flash-0731-w8a8` 里的 `mtp.*`（即 INT8 反量化的起点）；
@@ -351,68 +355,93 @@ vllm:spec_decode_num_accepted_tokens_per_pos{pos=1..6}  0
 - **dtype**（§4.2）：24 个参数是 BF16，但运算全程上采，且 serving 侧还会再上采一次。
   这个量级的偏差不可能把 88% 打到 4.6%。
 
-### 5.4 嫌疑排序
+### 5.4 权重是对的——嫌疑 1、2 都排除
 
-**嫌疑 1：warm start 没有真正生效。** 追完 `_finish_registered_draft`
-（`model_providers.py:158-190`）的三条分支，只有一条是静默的：
+`scripts/compare_draft_to_official.py` 的结果：
 
-| 条件 | 行为 |
-| --- | --- |
-| 路径已配 且 不是 SpecForge checkpoint | `load_official_checkpoint` —— 缺任何权重都**抛错**，不会静默 |
-| 路径已配 且 是 SpecForge checkpoint | `warm_start_draft_model` —— 同样会报 |
-| **路径为空** | `_warm_start`（`:71-72`）**直接 return，什么都不打** → 随机初始化 |
+```
+verdict        : warm start held; the drafter is a fine-tune of the official one
+median_cosine  : 0.99988
+min_cosine     : 0.95958
+```
 
-也就是说，只要 `model.draft_checkpoint_path` 配到了，warm start 要么成功要么报错；
-一旦为空，整个 run **没有任何证据**说明权重是随机的。100 步从零训出来的正是
-"退化输出"这个量级。
+median cosine 0.9999 对应的相对偏差约 `√(2×1e-4) ≈ 1.4%`。**这个 drafter 实质上
+就是官方 drafter。** 于是：
 
-> 已修（本次提交）：三条分支现在都打日志，第三条打的是 `WARNING ... RANDOM
-> INITIALISATION`。以后翻一眼日志就能定这件事，不用再靠权重比对反推。
+- **嫌疑 1（warm start 没生效）排除** —— 随机初始化的 cosine 会在 0 附近。
+- **嫌疑 2（学习率毁了它）排除** —— 权重压根没怎么动过。100 步 × 5e-5 的位移
+  在数值上确实是小的，之前那个 16% 是上界、实际远小于它。
+- **嫌疑 3（100 步太少）也不成立** —— 起点就是官方权重，"训得少"只意味着
+  接近官方，不意味着退化。
 
-**嫌疑 2：学习率对一个已收敛的模型过大。** recipe 里是
-`learning_rate: 2.0e-4`、`warmup_ratio: 0.04`、`max_steps: 10000`，
-所以 warmup 是 400 步，step 100 时 lr ≈ `2e-4 × 100/400 = 5e-5`。
-AdamW 每元素每步的位移量级约等于 lr，累计上界
-`Σ lr_t ≈ 5e-7 × Σ_{t≤100} t ≈ 2.5e-3`；而 4096 宽线性层的权重标准差约
-`1/√4096 ≈ 0.0156`。**上界相当于 16% 的相对位移**，而这期间只看过
-`1 × 4 × 100 = 400` 条序列。这个 lr 是 EAGLE3 从零训的默认值，
-不是给"微调一个已收敛的官方 drafter"用的。
+**结论倒过来了：问题不在权重，在 serving 路径。** 一个和官方几乎逐比特相同的
+drafter 拿到 4.6%，而官方同权重在 same-checkpoint 模式下是 0.88（golden），
+差异只可能来自**两种模式喂给 drafter 的东西不同**。
 
-（这是上界，梯度方向会互相抵消，所以它单独未必能把 88% 打到 4.6%；
-但和嫌疑 1 叠加时它会放大后果。）
+### 5.5 独立目录 vs same-checkpoint：全部差异
 
-**嫌疑 3：100 步太少。** 只在嫌疑 1 成立时才是主因——warm start 生效的话，
-100 步不该让接受率掉到 4.6%。
+这是现在仅剩的解释空间。逐条列出，按可疑度排序。
 
-### 5.5 判据（按成本从低到高，做完 1-3 再上卡）
+**(a) draft config 的来源 —— 最可疑。**
+same-checkpoint 模式下 `draft_model_config.hf_config` **就是 target 的
+`config.json`**；独立目录模式下是我们导出的那份。vLLM-Ascend 从 draft config
+读这些字段：
 
-1. **训练日志里 step 1 的 `accuracy`（免费）。** warm start 生效的话，
-   第一步的 accuracy 就该是高值；若从 ~0 开始往上爬，说明是从随机权重学起的，
-   嫌疑 1 直接坐实。**注意 recipe 的 `log_interval: 20`**——第一条打印出现在
-   step 20，不是 step 1；重跑时用 `training.log_interval=1`。
-   顺带确认当时那个 run 的 `model.draft_checkpoint_path` 到底配的是什么。
-2. **serving 日志里 `DSpark draft model loaded: N params`（免费）。**
-   记下 N，确认没有大批权重没落位。
-3. **离线比对导出件与官方权重**：
+| 字段 | 驱动什么 | 不一致会报错吗 |
+| --- | --- | --- |
+| `dspark_target_layer_ids` | 喂给 drafter 的是哪几层的 hidden state | **不会** |
+| `dspark_noise_token_id` → `ptd_token_id` | drafter 用来填充 block 的 token | **不会** |
+| `dspark_block_size` | 并行块宽度 | **不会** |
+| `num_hidden_layers` | `mtp_start_layer_idx`，即三个 stage 占哪些层号 | **不会** |
+| `n_mtp_layers` / `dspark_num_mtp_layers` | 建几个 stage | **不会** |
+| `n_group` | 分组 top-k 路由（缺省 1） | **不会** |
+| `rms_norm_eps` / `hc_eps` | 各处 epsilon | **不会** |
+| `hc_mult` / `dspark_markov_rank` / `hidden_size` / `vocab_size` / `n_routed_experts` / `num_attention_heads` | 各种宽度 | 会（形状对不上） |
 
-   ```bash
-   python scripts/compare_draft_to_official.py \
-       --draft-dir    /sharenfs/w00958190/dsv4-dspark/0901_export/deepseek-v4-flash-dspark-export \
-       --official-dir /sharenfs/DeepSeek-V4-Flash-0731-w8a8
-   ```
+**前七行不改变任何张量形状，所以对不上也不报错，只是让 drafter 失效。**
+一条命令查完：
 
-   它按 stage 抽 14 类张量 + 8 个 stage 专属张量，把官方侧的 W8A8 反量化后
-   逐张量算 cosine 和相对 L2，最后给一个判定：
+```bash
+python scripts/diff_dspark_serving_config.py \
+    --draft-dir  /sharenfs/w00958190/dsv4-dspark/0901_export/deepseek-v4-flash-dspark-export \
+    --target-dir /sharenfs/DeepSeek-V4-Flash-0731-w8a8
+```
 
-   | median cosine | 含义 |
-   | --- | --- |
-   | > 0.99 | warm start 生效，这是官方 drafter 的微调版 → 查嫌疑 2（学习率/目标函数） |
-   | 0.05 – 0.5 | 已经和官方没什么关系 |
-   | < 0.05 | **随机初始化**，warm start 从未生效 → 嫌疑 1 坐实 |
+**(b) drafter 的量化方式不同 —— 次可疑。**
+same-checkpoint 下 drafter 是 W8A8（`patch_dspark` 让它继承 target 的量化配置），
+走 `AscendLinearMethod` / `AscendFusedMoEMethod`；独立目录下是 BF16，
+走 `AscendUnquantizedLinearMethod` / `AscendUnquantizedFusedMoEMethod`。
+**BF16 的 DSpark draft 是一条没有先例的路径**——§1.6 已经查过，vllm-ascend 的
+文档和 e2e 全部是 same-checkpoint，e2e 用的还是 w4a8 权重。数值上 BF16 只会更准，
+所以这里若有问题，是未量化路径本身的实现问题，不是精度问题。
 
-4. **官方基线**（占卡）：用 same-checkpoint 模式跑同一组 prompt，
-   拿到这台机器上官方 drafter 的接受率。**这个数一直没测**，
-   没有它就无法排除"这台机器上官方也不高"。
+**(c) "权重没加载"的安全网在这条路上是关的 —— 需要单独确认。**
+`vllm/model_executor/model_loader/default_loader.py:455-465` 会在加载后检查
+"哪些参数没有被 checkpoint 初始化"并抛错，**但对定义了
+`process_weights_after_loading` 的模块，它会把该模块的所有参数直接标记为已加载**
+再做差集。而 `AscendUnquantizedLinearMethod`（`ops/linear.py:92`）和
+`AscendUnquantizedFusedMoEMethod`（`ops/fused_moe/routed_experts.py:74`）都定义了
+这个钩子。**所以 BF16 draft 的线性层和 MoE 层即使漏加载也不会报错。**
+
+对照办法（不需要额外代码）：两种模式各起一次，比较日志里
+
+```
+DSpark draft model loaded: N params
+```
+
+的 N。两次应当完全相同；不同就说明有权重在某一侧没落位。
+
+### 5.6 下一步（按成本）
+
+1. **`diff_dspark_serving_config.py`**（秒级，不占卡）。
+2. **官方 same-checkpoint 基线**（正在跑）。这个数据点决定后面怎么走：
+   - 官方 ≈ 0.88 → 差异确实在独立目录这条路上，按 (a)(b)(c) 往下查；
+   - 官方也很低 → 是测试方法的问题（prompt 集、采样参数），
+     我们的 drafter 可能并没有问题。
+3. **两次运行的 `DSpark draft model loaded: N params` 对比**（免费，跟着第 2 步一起拿）。
+4. 若 (a)(c) 都干净而官方是 0.88，那就落到 (b)：
+   把 drafter 也量化成 W8A8 放进独立目录（§6），让两条路除了权重以外完全一致。
+   这本来就是第二步要做的事，只是提前成为定位手段。
 
 ## 6. 第二步：量化
 
