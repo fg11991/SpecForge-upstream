@@ -423,17 +423,31 @@ same-checkpoint 下 drafter 是 W8A8（`patch_dspark` 让它继承 target 的量
 `AscendUnquantizedFusedMoEMethod`（`ops/fused_moe/routed_experts.py:74`）都定义了
 这个钩子。**所以 BF16 draft 的线性层和 MoE 层即使漏加载也不会报错。**
 
-对照办法（不需要额外代码）：两种模式各起一次，比较日志里
+两个查法：
+
+```bash
+# 1) 离线：我们导出的每个张量名，vllm-ascend 的 remap 认不认、有没有撞名
+python scripts/check_dspark_serving_names.py --draft-dir <导出目录>
+```
+
+它只读 safetensors header，把 2378 个名字过一遍 `_remap_dspark_name` 的镜像实现，
+报两类问题：**映射为空**（会被 `continue` 静默丢掉）和**多个名字落到同一个参数**
+（迭代顺序决定谁赢）。
 
 ```
+# 2) 在线：两种模式各起一次，比日志里这一行的 N
 DSpark draft model loaded: N params
 ```
 
-的 N。两次应当完全相同；不同就说明有权重在某一侧没落位。
+两次应当完全相同；不同就说明有权重在某一侧没落位。
+
+> 脚本里的 remap 是 `dedbb34` 的**拷贝**，会随上游漂移。它报干净只说明
+> "按那一版的规则没问题"，不能替代上面第 2 条的实测对照。
 
 ### 5.6 下一步（按成本）
 
-1. **`diff_dspark_serving_config.py`**（秒级，不占卡）。
+1. **`diff_dspark_serving_config.py`** 和 **`check_dspark_serving_names.py`**
+   （都是秒级、不占卡、只读文件）。
 2. **官方 same-checkpoint 基线**（正在跑）。这个数据点决定后面怎么走：
    - 官方 ≈ 0.88 → 差异确实在独立目录这条路上，按 (a)(b)(c) 往下查；
    - 官方也很低 → 是测试方法的问题（prompt 集、采样参数），
