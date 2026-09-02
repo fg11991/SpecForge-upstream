@@ -1,6 +1,6 @@
 # DeepSeek-V4 DSpark 微调权重回灌 vLLM-Ascend：上机方案
 
-- 日期：2026-09-01
+- 日期：2026-09-01；**修订 2026-09-02**（§4.3 补基线、§5.4 收回结论、§5.5 关闭 (a)(c) 并新增 (d)、§5.6 重排）
 - 分支：`dsv4-moe-dspark-trainable`
 - 核验对象：
   - `fg11991/vllm-ascend`，分支 `vllm-0.27-dsv4`，commit `dedbb34`
@@ -21,10 +21,13 @@
 2. **导出件是完整的**，但 `config.json` 必须改三个字段，其中 `model_type` 是硬性的
    ——vLLM 那段自动覆写发生在 `ModelConfig` 构造之后，救不了构造阶段的解析失败（§2.2，实测）。
 3. **ModelSlim warm start 是对的**：description 的 key 就是磁盘张量名（实测 7022/7022）。
-4. **首次上机跑通了，但接受率 4.6%（官方 golden 0.88）**（§5）。特征契约（§4.1）、
-   warm start、学习率**全部排除**——导出件与官方权重的 median cosine 是 0.99988，
-   这个 drafter 实质上就是官方 drafter。所以问题在 serving 路径，
-   即"独立 draft 目录"与 same-checkpoint 两种模式的差异（§5.5）。
+4. **首次上机跑通了，但接受率 4.6%；同机官方 same-checkpoint 基线是 7 步平均约 60%**（§5）。
+   特征契约（§4.1）、warm start、学习率已排除；serving 路径这边，(a) draft config 已用
+   两份真实 config 逐条算完**排除**、(c) 权重落位**基本关闭**，只剩 (b) 未量化路径
+   ——但沿着 `quant_config is None` 挖了一层，找不到任何可指名的机制
+   （2026-09-02 对齐 `dedbb34` / `3d04f15`）。现存最强嫌疑是 §5.5(d)：**router 的
+   `gate.bias` 在 100 步里被无梯度的负载均衡更新推了最多 ±0.1，而 cosine 对这种改动
+   是结构性地盲的**——它改的是每个 token 走哪 6 个 expert，一个权重矩阵都不用动。
 5. 次要风险已定性：声明为 FP32 的 27 个参数里，24 个在**训练全程**就是 BF16
    （FSDP1 的 flat-param 约束所致），但运算全程上采、`gate.bias` 已被单独保住，serving 无影响（§4.2）。
 
@@ -52,10 +55,13 @@
 | 16 | 该 drafter 的接受率 pos0 = 4.6%（20/439），pos1-6 全 0 | `/metrics`，见 §5 | 实测 |
 | 17 | 导出件与官方 `mtp.*` 的 median cosine = 0.99988（min 0.95958） | `compare_draft_to_official.py` | 实测 |
 | 18 | BF16 draft 的线性/MoE 层**不受** vLLM"未初始化权重"检查保护 | `default_loader.py:455-465` 对有 `process_weights_after_loading` 的模块跳过检查；两个 Unquantized method 都有 | 源码 |
+| 19 | 同机官方 same-checkpoint drafter 的 7 步平均接受率约 60% | 用户在 A2 八卡实测，`num_speculative_tokens=7` | 实测 |
+| 20 | 独立目录与 same-checkpoint 的 draft-config **有效值**逐条相同 | 两份真实 `config.json` 走完各自的解析链，见 §5.5(a) | 实测+源码 |
+| 21 | `mtp.*.ffn.gate.bias` 每个 optimizer step 被无梯度地加 ±0.001 | `deepseek_v4_dspark.py:669-681`，与 lr/梯度无关 | 源码 |
 
 补充事实（用户提供）：训练已跑通并导出；warm start 用的就是
 `DeepSeek-V4-Flash-0731-w8a8` 里的 `mtp.*`（即 INT8 反量化的起点）；
-训练指标正常、梯度不爆、accuracy 有上升；接受率基线待测。
+训练指标正常、梯度不爆、accuracy 有上升；接受率基线见事实 19。
 
 ---
 
@@ -300,6 +306,8 @@ config.json 用 target 的，我们导出的那个在这条路上完全用不上
    `after_optimizer_step` 里 `bias.add_(±0.001)` 的累加因此没有 BF16 的
    round-to-nothing 问题，负载均衡是正常工作的。
    （初版文档判断这里会失效，是错的。）
+   **但"正常工作"正是问题所在**：它保住的是精度，因而保证了每步 ±0.001 完整累加。
+   见 §5.5(d)。
 2. 剩下 24 个的**运算全程上采到 FP32**（`fn.float()` / `base.float()` /
    `scale.float()`，见 `:940-1000` 的 hc 前向），丢的是存储精度不是计算精度。
 
@@ -308,10 +316,14 @@ AdamW 对这 24 个参数的小幅更新会有舍入损失。这不是 DSpark �
 要改得动 FSDP 的混合精度配置，不在本轮范围内。serving 侧无影响：
 vLLM-Ascend 把它们声明为 FP32，加载时 `copy_` 自动上采。
 
-### 4.3 没有接受率基线 —— 中
+### 4.3 ~~没有接受率基线~~ —— **已测**（2026-09-02）
 
-官方 drafter 在**同一台机器、同一组 prompt**下的接受率还没测。
-没有它，第一步做完也无法判断成败。这件事和上机是同一次服务的两趟跑，成本很低。
+官方 same-checkpoint drafter 在同一台 A2 八卡上、`num_speculative_tokens=7`，
+**7 步平均接受率约 60%**。§5.6 原来的分叉因此解决：官方在这台机器上是好的，
+4.6% 不是测试方法的问题，本 drafter 是真的坏了。
+
+口径提醒：60% 是 7 个位置的平均，4.6% 是 pos0 单点。最终对比要统一成 `/metrics` 的
+逐 pos `accepted/drafts`，并且同一组 prompt、同样的采样参数。
 
 ### 4.4 第二步的量化 —— 低
 
@@ -336,6 +348,9 @@ vllm:spec_decode_num_accepted_tokens_per_pos{pos=1..6}  0
 | pos 0 | **4.6%**（20/439） | 0.88 |
 | pos 1-6 | 0 | 0.74 / 0.58 / 0.49 / 0.40 / 0.30 / 0.18 |
 
+同机官方 same-checkpoint 基线（2026-09-02 实测）：`num_speculative_tokens=7` 下
+**7 步平均约 60%**。所以对照物不再只有 golden——本 drafter 是真的坏了，不是测法问题。
+
 ### 5.2 这些数字说明什么
 
 **pos 1-6 全 0 不是额外信息。** 每位置接受率约 4.5% 的话，pos1 的期望命中次数是
@@ -346,7 +361,7 @@ vllm:spec_decode_num_accepted_tokens_per_pos{pos=1..6}  0
 而一个退化输出（总是给高频 token：空格、换行、常见标点）大致就能蹭到百分之几。
 所以现象是"**drafter 输出接近退化，不是稍弱**"——这把"训练不够、再多训点就好"
 这个解释排掉了：从官方权重 warm start 的模型不会退化成这样，除非起点就不对
-或者训练把它推走了。
+或者训练把它推走了。（后者正是 §5.5(d) 说的那条路——不经过梯度。）
 
 ### 5.3 已排除的原因
 
@@ -355,7 +370,7 @@ vllm:spec_decode_num_accepted_tokens_per_pos{pos=1..6}  0
 - **dtype**（§4.2）：24 个参数是 BF16，但运算全程上采，且 serving 侧还会再上采一次。
   这个量级的偏差不可能把 88% 打到 4.6%。
 
-### 5.4 权重是对的——嫌疑 1、2 都排除
+### 5.4 cosine 排除了什么、没排除什么（2026-09-02 修订）
 
 `scripts/compare_draft_to_official.py` 的结果：
 
@@ -365,41 +380,73 @@ median_cosine  : 0.99988
 min_cosine     : 0.95958
 ```
 
-median cosine 0.9999 对应的相对偏差约 `√(2×1e-4) ≈ 1.4%`。**这个 drafter 实质上
-就是官方 drafter。** 于是：
+median cosine 0.9999 对应的相对偏差约 `√(2×1e-4) ≈ 1.4%`。它**确实**排除了两件事：
 
 - **嫌疑 1（warm start 没生效）排除** —— 随机初始化的 cosine 会在 0 附近。
-- **嫌疑 2（学习率毁了它）排除** —— 权重压根没怎么动过。100 步 × 5e-5 的位移
+- **嫌疑 2（学习率毁了它）排除** —— 每个权重矩阵都几乎没动。100 步 × 5e-5 的位移
   在数值上确实是小的，之前那个 16% 是上界、实际远小于它。
 - **嫌疑 3（100 步太少）也不成立** —— 起点就是官方权重，"训得少"只意味着
   接近官方，不意味着退化。
 
-**结论倒过来了：问题不在权重，在 serving 路径。** 一个和官方几乎逐比特相同的
-drafter 拿到 4.6%，而官方同权重在 same-checkpoint 模式下是 0.88（golden），
-差异只可能来自**两种模式喂给 drafter 的东西不同**。
+**但它没有排除"权重变了"这个类别本身。** 本文初版在这里下了"问题不在权重、在
+serving 路径"的结论，那一步跨大了：cosine 是逐张量、且对**尺度不变**的相似度，
+它衡量的是"每个矩阵还是不是原来那个矩阵"，衡量不了"这些矩阵还会不会被同样地用到"。
+DSpark 里恰好有一组参数属于后者——router 的 `gate.bias`，768 个数，
+它决定每个 token 走哪 6 个 expert，而且是被一条**与梯度、与学习率都无关**的规则
+每个 optimizer step 推一次的。见 §5.5(d)。
+
+`compare_draft_to_official.py` 其实已经逐张量算了 `relative_l2` / `max_abs_diff` /
+`official_absmax`，只是 verdict 只汇总了 cosine。用 `--output` 把明细导出来、按
+`relative_l2` 排序，才是这一步该有的判据。
 
 ### 5.5 独立目录 vs same-checkpoint：全部差异
 
-这是现在仅剩的解释空间。逐条列出，按可疑度排序。
+(a)(b)(c) 是"两种模式的差异"；(d) 是这轮回头补上的、不属于模式差异的一条。
+按现在的可疑度排序，最强的是 (d)。
 
-**(a) draft config 的来源 —— 最可疑。**
+**(a) draft config 的来源 —— 已排除**（2026-09-02，用两份真实 `config.json` 逐条算过）。
+
 same-checkpoint 模式下 `draft_model_config.hf_config` **就是 target 的
-`config.json`**；独立目录模式下是我们导出的那份。vLLM-Ascend 从 draft config
-读这些字段：
+`config.json`**；独立目录模式下是我们导出的那份。`DeepseekV4DSparkModel.__init__`
+第一行就是 `config = vllm_config.speculative_config.draft_model_config.hf_config`
+（`models/deepseek_v4/dspark.py:118-129`），所以外层 drafter 的每个尺寸、每个开关
+都来自我们导出的 config。
 
-| 字段 | 驱动什么 | 不一致会报错吗 |
-| --- | --- | --- |
-| `dspark_target_layer_ids` | 喂给 drafter 的是哪几层的 hidden state | **不会** |
-| `dspark_noise_token_id` → `ptd_token_id` | drafter 用来填充 block 的 token | **不会** |
-| `dspark_block_size` | 并行块宽度 | **不会** |
-| `num_hidden_layers` | `mtp_start_layer_idx`，即三个 stage 占哪些层号 | **不会** |
-| `n_mtp_layers` / `dspark_num_mtp_layers` | 建几个 stage | **不会** |
-| `n_group` | 分组 top-k 路由（缺省 1） | **不会** |
-| `rms_norm_eps` / `hc_eps` | 各处 epsilon | **不会** |
-| `hc_mult` / `dspark_markov_rank` / `hidden_size` / `vocab_size` / `n_routed_experts` / `num_attention_heads` | 各种宽度 | 会（形状对不上） |
+`diff_dspark_serving_config.py` 报"每个字段都一致"，但**它的字段表不完整**：要比的
+不是字段名，是走完优先级链之后的**有效值**，而有四条链在 vLLM 侧、不在 vllm-ascend 侧，
+脚本没覆盖。逐条算完的结果（两边常常命中链上不同的分支，落点一致）：
 
-**前七行不改变任何张量形状，所以对不上也不报错，只是让 drafter 失效。**
-一条命令查完：
+| 有效值 | draft 命中的分支 | target 命中的分支 | 结论 |
+| --- | --- | --- | --- |
+| ptd / mask token | `dflash_config.mask_token_id` = 128799（第一顺位） | 无 `dflash_config`、无顶层 `mask_token_id` → `dspark_noise_token_id` = 128799 | 同 |
+| aux 层 | vLLM 层 `dflash_config.target_layer_ids`+1 → (41,42,43)，ascend 的分支不执行 | vLLM 层返回 None → ascend `dspark_target_layer_ids`+1 → (41,42,43) | 同 |
+| `sample_from_anchor` | 字段不存在 → 默认 True | 字段不存在 → 默认 True | 同 |
+| `use_non_causal` | 无 `layer_types`、`dflash_config` 里无 `causal` → 每层非因果 → True | 同样两个都没有 → True | 同 |
+| draft 层的 compress ratio | 无 `compress_ratios` → `get_dsv4_compress_ratio` 返回 0 | `compress_ratios[43..45]` = 0,0,0 | 同 |
+| `model_uses_sfa_sparse` | 无 `index_topk` → False | 有 `index_topk` 但也有 `compress_ratios` → False | 同 |
+| 其余尺寸与 epsilon | `num_hidden_layers` 43、`hc_mult` 4、`hidden_size` 4096、`vocab_size` 129280、`dspark_markov_rank` 256、`n_routed_experts` 256、`num_attention_heads` 64、`n_group` 两边都缺→1、`rms_norm_eps`/`hc_eps` 1e-6、有效 stage 数 3 | 同左 | 同 |
+
+四条链的位置（**都在 vLLM，不在 vllm-ascend**，这是脚本当初漏掉它们的原因）：
+
+- `vllm/v1/worker/gpu/spec_decode/utils.py:55-77` —— ptd token 的五顺位解析；
+- `vllm/v1/worker/gpu_model_runner.py:5503-5536` —— aux 层，**先于**
+  `vllm_ascend/worker/model_runner_v1.py:675-689` 执行；
+- `vllm/v1/worker/gpu/spec_decode/dspark/speculator.py:46-52` —— `sample_from_anchor`，
+  决定每请求发 N 个还是 1+N 个 query，以及 `sample_pos = query_pos + 1`；
+- `vllm/v1/worker/gpu/spec_decode/dspark/utils.py:28` +
+  `vllm/model_executor/models/qwen3_dflash.py:58-72` —— `use_non_causal`。
+
+顺带把事实 10 的机制钉死：`initialize_model`（`vllm/model_executor/model_loader/utils.py:41-62`）
+只用传入的 `model_config` **选模型类**，构造时传的是 `draft_vllm_config`，而
+`load_dspark_model` 的 `replace(...)` 没有改 `model_config`——所以 DSpark 模型内部的
+`vllm_config.model_config.hf_config` 仍是 target 的。这也是 draft config 缺
+`num_hash_layers`（`deepseek_v4.py:418` 是直接属性访问，缺了会 AttributeError）
+却没有炸的原因。
+
+`dspark_block_size` 可以从风险清单里划掉：dedbb34 里它只在 `dspark.py:126` 存进
+`self.block_size`，全文件再没被读过。
+
+复查命令（字段级，仍值得跑，但不要只信它）：
 
 ```bash
 python scripts/diff_dspark_serving_config.py \
@@ -407,7 +454,7 @@ python scripts/diff_dspark_serving_config.py \
     --target-dir /sharenfs/DeepSeek-V4-Flash-0731-w8a8
 ```
 
-**(b) drafter 的量化方式不同 —— 次可疑。**
+**(b) drafter 的量化方式不同 —— 仍未排除，但找不到机制。**
 same-checkpoint 下 drafter 是 W8A8（`patch_dspark` 让它继承 target 的量化配置），
 走 `AscendLinearMethod` / `AscendFusedMoEMethod`；独立目录下是 BF16，
 走 `AscendUnquantizedLinearMethod` / `AscendUnquantizedFusedMoEMethod`。
@@ -415,7 +462,21 @@ same-checkpoint 下 drafter 是 W8A8（`patch_dspark` 让它继承 target 的量
 文档和 e2e 全部是 same-checkpoint，e2e 用的还是 w4a8 权重。数值上 BF16 只会更准，
 所以这里若有问题，是未量化路径本身的实现问题，不是精度问题。
 
-**(c) "权重没加载"的安全网在这条路上是关的 —— 需要单独确认。**
+2026-09-02 沿着 `quant_config is None` 又挖了一层，三条候选机制都不成立：
+
+- `rotation_path`（`dspark.py:315-317`）确实只在 `quant_config` 非 None 时才取，
+  但它只用于给**裸名** `embed.weight` / `head.weight` 改名（`:436-439`）。
+  我们的名字带 `mtp.` 前缀，走不到那两个分支，inert。
+- `swiglu_limit`（10.0）/ `routed_scaling_factor`（1.5）/ `norm_topk_prob` 都来自
+  `FusedMoEConfig`，而它由 decoder layer 用 **target config** 构造
+  （`deepseek_v4.py:355-470`），与量化方法无关。曾怀疑未量化路径会把
+  `swiglu_limit` 掉成 0（那会让 `gate.clamp(max=0)` 把 expert 输出清零），不成立。
+- `AscendUnquantizedFusedMoEMethod.process_weights_after_loading`
+  （`ops/fused_moe/routed_experts.py:74-103`）只做 transpose + NZ 转换，没有额外语义。
+
+所以 (b) 目前只剩"这条路没有先例"这一句，没有可指名的嫌疑点。
+
+**(c) "权重没加载"的安全网在这条路上是关的 —— 基本关闭（2026-09-02 复核）。**
 `vllm/model_executor/model_loader/default_loader.py:455-465` 会在加载后检查
 "哪些参数没有被 checkpoint 初始化"并抛错，**但对定义了
 `process_weights_after_loading` 的模块，它会把该模块的所有参数直接标记为已加载**
@@ -444,18 +505,91 @@ DSpark draft model loaded: N params
 > 脚本里的 remap 是 `dedbb34` 的**拷贝**，会随上游漂移。它报干净只说明
 > "按那一版的规则没问题"，不能替代上面第 2 条的实测对照。
 
+**2026-09-02 复核：(c) 基本可以关闭。** 逐行对过 `dedbb34` 的 `load_weights`：
+
+- 脚本里的 remap 镜像与 `dspark.py:502-541` **完全一致**，包括
+  `confidence_head.` → `model.confidence_head.*`（这一版真的建了 `DSparkConfidenceHead`
+  并加载它，不像别的分支直接 `return None` 丢掉）；
+- 加载分支全是 `params_dict[...]` **直接下标**（`:461` experts、`:483` stacked、
+  `:491` attn_sink、`:494` 兜底），映射到不存在的参数会 KeyError 而不是静默丢弃。
+  事实 18 说的"安全网被关掉"是真的，但在这条路上没有可乘之机；
+- 真正的静默窗口只剩"模型里有、却没有任何导出张量映射过去的参数"——而这个集合在
+  两种模式下是同一个，两边都只喂 `mtp.*` 那 2378 个名字。
+
+剩下唯一依赖导出完整性的地方是 §2.4 的 embed/head 归属：`_should_share` 用的是
+`getattr(eagle, flag, False)`，**默认 False**。flag 由 `process_eagle_weight`
+（`dspark.py:450`）在看到 `model.embed_tokens.weight` / `lm_head.weight` 这两个
+**remap 之后**的名字时置位。所以导出件里只要少了 `mtp.0.embed.weight` 或
+`mtp.2.head.weight`，drafter 就会静默改用 target 的表——而这是 `642c237`
+明确量过会让 warm start 的 drafter 表现得像随机初始化的那件事。
+事实 3 已实测两个都在，这条闭合，但它靠的是导出完整性，不是代码保护。
+
+
+**(d) router 的 `gate.bias` 被无梯度地推走了 —— 现存最强嫌疑（2026-09-02 新增）。**
+
+这一条不是两种模式的差异，而是 §5.4 的 cosine 判据漏掉的东西：
+**两边喂给 drafter 的权重本身就不是同一份，差的正是这 768 个数。**
+
+`DeepseekV4Gate.after_optimizer_step`
+（`specforge/modeling/draft/deepseek_v4_dspark.py:669-681`）：
+
+```python
+counts = self._routing_counts.clone(); self._routing_counts.zero_()
+dist.all_reduce(counts, group=process_group)
+target = counts.mean()
+self.bias.add_(torch.sign(target - counts).to(self.bias) * self.bias_update_rate)
+```
+
+`bias_update_rate = router_bias_update_rate = 0.001`，每个 optimizer step 加一次，
+`sign()` 只取 ±1（恰好等于均值才为 0，几乎不发生）。这次跑了 100 步，
+**3 × 256 = 768 个 bias 元素每一个都被推了最多 ±0.1**。这条更新的性质：
+
+- **与梯度、学习率、以及 `max_steps × accumulation_steps` 的 token 量都无关**，
+  它只数 optimizer step。所以"只训了 100 步、权重几乎没动"这个前提对它**不成立**；
+- 它决定 `noaux_tc` 的 top-k 选谁，也就是三个 stage 里每个 token 走哪 6 个 expert；
+- 而 expert 权重本身还是官方的：**用漂移过的路由器去选一组没动过的专家**，
+  这是把一个训练好的 MoE 拆散的最短路径，且一个权重矩阵都不用改；
+- **cosine 看不见它**：256 维向量整体叠 ±0.1 的扰动，只要官方 bias 的量级在 0.3 以上，
+  cosine 仍有 0.95~0.99。§5.4 的 `min_cosine = 0.95958` 很可能就是它；
+- §4.2 说"`gate.bias` 被单独保成 FP32、负载均衡正常工作"——那句话是对的，
+  但它保住的是**精度**，恰恰保证了每步 ±0.001 完整累加进去，不被 BF16 的
+  round-to-nothing 吃掉。
+
+它同时解释了 §5.4 那个别扭之处：官方同权重 60%、我们 4.6%——因为两边并不是同一份
+权重，而这 768 个数是唯一一组"L2 改动极小、功能上非线性放大"的参数。
+
+验证两步，第一步秒级：
+
+```bash
+python scripts/compare_draft_to_official.py \
+    --draft-dir    /sharenfs/w00958190/dsv4-dspark/0901_export/deepseek-v4-flash-dspark-export \
+    --official-dir /sharenfs/DeepSeek-V4-Flash-0731-w8a8 \
+    --output /tmp/cmp.json
+```
+
+按 `relative_l2` 排序看前 20，并单独看三个 `mtp.{0,1,2}.ffn.gate.bias`。判据：
+它们的 `max_abs_diff` 是否 ≈ 0.1（= 100 × 0.001，说明每个元素都吃满了），
+以及相对 `official_absmax` 有多大；`min_cosine` 那一项是不是它们之一。
+
+第二步：把官方的三个 `gate.bias` **原地覆回**导出件再起一次。dtype（F32）和
+shape（[256]）都不变，可以按 safetensors 的字节偏移直接打补丁，不必重写那 38.9 GiB
+（记得先把旧字节备份下来）。接受率跳回 60% 量级即定案。
+
+若确认，短期微调的正式做法是把 `router_bias_update_rate` 设为 0，或让它按 token 数
+而非 optimizer step 数缩放——而不是每次导出后手工覆盖。
+
 ### 5.6 下一步（按成本）
 
-1. **`diff_dspark_serving_config.py`** 和 **`check_dspark_serving_names.py`**
-   （都是秒级、不占卡、只读文件）。
-2. **官方 same-checkpoint 基线**（正在跑）。这个数据点决定后面怎么走：
-   - 官方 ≈ 0.88 → 差异确实在独立目录这条路上，按 (a)(b)(c) 往下查；
-   - 官方也很低 → 是测试方法的问题（prompt 集、采样参数），
-     我们的 drafter 可能并没有问题。
-3. **两次运行的 `DSpark draft model loaded: N params` 对比**（免费，跟着第 2 步一起拿）。
-4. 若 (a)(c) 都干净而官方是 0.88，那就落到 (b)：
-   把 drafter 也量化成 W8A8 放进独立目录（§6），让两条路除了权重以外完全一致。
-   这本来就是第二步要做的事，只是提前成为定位手段。
+前提已经变了：官方基线拿到了（事实 19，7 步平均约 60%），(a) 已排除，(c) 基本关闭。
+
+1. **`compare_draft_to_official.py --output` + 按 `relative_l2` 排序**（秒级、离线）。
+   直接判 (d)：三个 `gate.bias` 的 `max_abs_diff` 是不是 ≈ 0.1。
+2. **把官方的三个 `gate.bias` 覆回导出件，重起一次**（一次服务，十分钟级）。
+   - 跳回 60% 量级 → (d) 定案，回训练侧改 `router_bias_update_rate`；
+   - 没跳 → 权重侧彻底洗清，落回 (b)：把 drafter 也量化成 W8A8 放进独立目录（§6），
+     让两条路除权重外完全一致。这本来就是第二步要做的事，只是提前成为定位手段。
+3. **训练日志 step 1 的 `acceptance_rate_*`**，以及两次服务日志的
+   `DSpark draft model loaded: N params` 对比（都免费，一直欠着）。
 
 ## 6. 第二步：量化
 
@@ -491,9 +625,11 @@ draft 目录里有 description 就被识别为 ModelSlim（`quantization/utils.p
 
 **先做（不上机）**
 
-1. §5.5 的判据 1-3：训练日志 step 1 的 accuracy、serving 日志的
-   `DSpark draft model loaded` 计数、`compare_draft_to_official.py`。
-   **这三条决定 4.6% 是加载问题还是训练问题。**
+1. **§5.5(d) 的第一步**：`compare_draft_to_official.py --output` 之后按
+   `relative_l2` 排序，看三个 `gate.bias` 的 `max_abs_diff` 是不是 ≈ 0.1。
+   **这一条决定 4.6% 是 router 漂移还是别的。**
+   顺带把一直欠着的两条拿掉：训练日志 step 1 的 `acceptance_rate_*`、
+   serving 日志的 `DSpark draft model loaded` 计数（两种模式各一次）。
 2. ~~4.1 的 mHC 折叠比对~~ / ~~4.2 的 dtype 诊断~~ —— 都已完成，见对应小节。
 3. ~~导出侧写死 serving 用的 config 字段~~ —— 已完成：
    `scripts/prepare_dspark_serving_config.py`（含 8 个单测）。放在导出之后而不是
@@ -502,23 +638,25 @@ draft 目录里有 description 就被识别为 ModelSlim（`quantization/utils.p
 
 **上机**
 
-4. 官方 drafter（same-checkpoint）的接受率基线——仍然欠着，且现在更要紧了。
+4. ~~官方 drafter（same-checkpoint）的接受率基线~~ —— 已测，7 步平均约 60%（事实 19）。
 5. ~~跑 §2.3 的命令~~ —— 已跑，结果见 §5。
+6. **把官方的三个 `gate.bias` 覆回导出件重起一次**（§5.5(d) 第二步），
+   这是目前唯一能一次定案的实验。
 
 **之后**
 
-6. §5 的量化导出器。
+7. §6 的量化导出器。若 (d) 不成立，它同时是 (b) 的定位手段。
 
 ---
 
 ## 8. 本文没有验证的
 
 1. ~~启动命令没实跑过~~ —— 已跑通（§5）。
-2. 显存与吞吐未测；接受率只有这一个数据点，且**官方基线仍未测**——
-   没有它就无法断定 4.6% 是"训练毁了它"还是"这台机器上官方也不高"。
+2. 显存与吞吐未测；本 drafter 的接受率仍只有 4.6% 这一个数据点
+   （官方基线已补，见事实 19）。
 3. ~~`captured.mean(dim=1)` 的正确性~~ —— 已排除（§4.1）。
-4. §5 那三条判据一条都还没跑，所以"warm start 没生效"目前只是嫌疑最大的假设，
-   不是结论。
+4. §5.5(d) 是**假设**，不是结论：`gate.bias` 的实际漂移量、以及它相对官方量级有多大，
+   都还没测；覆盖回官方值的 A/B 也还没做。这两步做完之前，不要把它当定论。
 5. 容器里实际安装的 `vllm_ascend` 是否逐字等于 `dedbb34`。用户确认用的是
    `fg11991/vllm-ascend@vllm-0.27-dsv4` 和 `fg11991/vllm@vllm-0.27-dsv4`，
    本文按此为准；但启动脚本里的 `VLLM_ASCEND_APPLY_DSV4_PATCH=1` 在这两个仓库里
