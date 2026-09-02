@@ -24,7 +24,8 @@
 4. **剩下真正的风险不在 serving，在特征**：SGLang capture patch 里的
    `captured.mean(dim=1)` 这个 mHC 折叠**从未与官方实现对过**。它错了的话，
    drafter 学的是另一个目标，接受率不会好，而且和量化、和加载都无关。
-5. 次要风险：模型声明为 FP32 的 27 个参数，在导出件里只剩 3 个是 F32。
+5. 次要风险已定性：声明为 FP32 的 27 个参数里，24 个在**训练全程**就是 BF16
+   （FSDP1 的 flat-param 约束所致），但运算全程上采、`gate.bias` 已被单独保住，serving 无影响（§4.2）。
 
 ---
 
@@ -88,7 +89,17 @@ deepseek-v4-flash-dspark-export/
 > 就是这个文件存不存在。链进去等于声明这个 BF16 draft 是量化的，
 > 然后拿 target 的标签去查我们的 BF16 权重。
 
-`config.json` 必须改三个字段：
+`config.json` 必须改三个字段。用脚本改（它同时会检查目录里没有混进
+`quant_model_description.json`，并把训练侧 config 备份成
+`config.json.specforge-training`，这样目录还能被 `AutoDraftModel.from_pretrained`
+读回去继续微调）：
+
+```bash
+python scripts/prepare_dspark_serving_config.py --draft-dir <导出目录>
+# 若下一步报 rope 相关的 KeyError，再加 --drop-rope-scaling
+```
+
+改的就是这三个字段：
 
 ```json
 "model_type": "deepseek_v4",
@@ -249,54 +260,45 @@ config.json 用 target 的，我们导出的那个在这条路上完全用不上
 `mean(dim=1)` 在同一批输入上比数值。这件事**应该在花力气做 serving 之前做**，
 因为它决定这个 drafter 值不值得上机。
 
-### 4.2 27 个 FP32 参数在导出件里只剩 3 个 —— 高
+### 4.2 24 个声明为 FP32 的参数在训练全程是 BF16 —— 中（已定性，非紧急）
 
 模型显式声明为 FP32 的参数刚好 27 个，与官方 checkpoint 的 F32 计数一致：
 
-| 参数 | 数量 | 声明处（`deepseek_v4_dspark.py`） |
-| --- | ---: | --- |
-| `attn_sink` | 3 | `:370` |
-| `gate.bias`（router correction bias） | 3 | `:621-625` |
-| `hc_attn_{fn,base,scale}` | 9 | `:889-894` |
-| `hc_ffn_{fn,base,scale}` | 9 | `:896-901` |
-| `hc_head_{fn,base,scale}` | 3 | `:928-933` |
+| 参数 | 数量 | 声明处（`deepseek_v4_dspark.py`） | 实际 dtype |
+| --- | ---: | --- | --- |
+| `gate.bias`（router correction bias） | 3 | `:620-622` | **FP32**（`DeepseekV4Gate._apply:628-634` 在每次 `.to()` 后强制恢复） |
+| `attn_sink` | 3 | `:370` | BF16 |
+| `hc_attn_{fn,base,scale}` | 9 | `:889-894` | BF16 |
+| `hc_ffn_{fn,base,scale}` | 9 | `:896-901` | BF16 |
+| `hc_head_{fn,base,scale}` | 3 | `:928-933` | BF16 |
 
-导出件实测 `Counter({'BF16': 2375, 'F32': 3})`。vLLM-Ascend 那边同样声明为 FP32
-（`model.py:697-700`、`model.py:473`、`dspark.py:357-367`），加载时 `copy_` 会自动升回
-FP32，不报错，但精度已经在导出时丢了。
+这解释了导出件实测的 `Counter({'BF16': 2375, 'F32': 3})`：**那 3 个 F32 就是三个
+`mtp.{0,1,2}.ffn.gate.bias`**，不需要再跑诊断确认。
 
-最担心 `gate.bias`：`noaux_tc` 用它和 routed score 相加后选 top-6，
-而 `router_bias_update_rate = 0.001` 的更新量在 BF16（8 位尾数）下很可能整个被舍掉
-——**如果训练时它就是 BF16，那 router 的负载均衡在整个训练过程里可能都没生效**。
+机理：`AutoDraftModel.from_config`（`specforge/modeling/auto.py:52-54`）在
+`set_default_dtype` 构造之后还有一句 `model = model.to(dtype=torch_dtype)`，
+把显式声明为 FP32 的**参数**一并降成 BF16。训练侧
+（`algorithms/model_providers.py:205-208`）和导出侧
+（`export/checkpoint_io.py:179`）走的是同一个函数，所以这不是导出时才掉的——
+**训练全程就是 BF16**。
 
-定位（两条，先跑第二条）：
+**这句 `.to()` 不能简单删掉**：训练用 FSDP1（`training/backend.py:317,349`），
+其 flat parameter 要求单元内 dtype 一致，而这个模型故意不声明 `_no_split_modules`
+（整模型一个 FSDP 单元），混合 dtype 的参数会直接报错。
 
-```bash
-# 导出件里哪 3 个还是 F32
-python - <<'EOF'
-import json, struct
-with open('model.safetensors','rb') as f:
-    n = struct.unpack('<Q', f.read(8))[0]; hdr = json.loads(f.read(n))
-hdr.pop('__metadata__', None)
-print('F32 :', [k for k,v in hdr.items() if v['dtype']=='F32'])
-for pat in ('attn_sink','gate.bias','hc_attn_fn','hc_head_fn'):
-    print(pat, ':', {v['dtype'] for k,v in hdr.items() if pat in k})
-EOF
+严重性比初判低，两条理由：
 
-# 训练 checkpoint 里它们是什么 dtype —— 决定是训练掉的还是导出掉的
-python - <<'EOF'
-import torch
-s = torch.load('<checkpoint>/training_state.pt', map_location='cpu', weights_only=False)
-d = s['draft_state_dict']
-for pat in ('attn_sink','gate.bias','hc_attn_fn','hc_head_fn'):
-    print(pat, ':', {v.dtype for k,v in d.items() if pat in k})
-EOF
-```
+1. **`gate.bias` 是 buffer，不进 flat param，代码已经单独保住了 FP32。**
+   `after_optimizer_step` 里 `bias.add_(±0.001)` 的累加因此没有 BF16 的
+   round-to-nothing 问题，负载均衡是正常工作的。
+   （初版文档判断这里会失效，是错的。）
+2. 剩下 24 个的**运算全程上采到 FP32**（`fn.float()` / `base.float()` /
+   `scale.float()`，见 `:940-1000` 的 hc 前向），丢的是存储精度不是计算精度。
 
-- 训练 checkpoint 里是 FP32 → 只是导出时被 `export/checkpoint_io.py:179` 的
-  `torch_dtype=torch.bfloat16` 一刀切了，改导出即可（保留声明为 FP32 的参数）。
-- 训练 checkpoint 里就是 BF16 → 训练阶段掉的，要回去看 backend 的 dtype 处理，
-  而且 4.1 之外又多一个"训练本身是否有效"的疑点。
+残留风险因此收敛为一个通用问题：**纯 BF16 训练、没有 FP32 master weights**，
+AdamW 对这 24 个参数的小幅更新会有舍入损失。这不是 DSpark 特有的 bug，
+要改得动 FSDP 的混合精度配置，不在本轮范围内。serving 侧无影响：
+vLLM-Ascend 把它们声明为 FP32，加载时 `copy_` 自动上采。
 
 ### 4.3 没有接受率基线 —— 中
 
@@ -345,8 +347,10 @@ draft 目录里有 description 就被识别为 ModelSlim（`quantization/utils.p
 
 1. 4.1 的 mHC 折叠数值比对。**这是决定 drafter 值不值得上机的那一条。**
 2. 4.2 的两条 dtype 诊断。
-3. 导出侧写死 `architectures: ["DSparkDraftModel"]` 和 `n_mtp_layers: 3`
-   （改在 `DeepseekV4DSparkConfig`，不要手改 json）。
+3. ~~导出侧写死 serving 用的 config 字段~~ —— 已完成：
+   `scripts/prepare_dspark_serving_config.py`（含 8 个单测）。放在导出之后而不是
+   `DeepseekV4DSparkConfig` 里，是因为训练侧要靠 `architectures` 解析模型类，
+   `export_to_hf` 的输出也要能被 `from_pretrained` 读回。
 
 **上机（一次服务跑两趟）**
 
