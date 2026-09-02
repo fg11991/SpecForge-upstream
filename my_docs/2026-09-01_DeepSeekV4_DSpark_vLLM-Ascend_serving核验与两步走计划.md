@@ -1,6 +1,7 @@
 # DeepSeek-V4 DSpark 微调权重回灌 vLLM-Ascend：上机方案
 
-- 日期：2026-09-01；**修订 2026-09-02**（§4.3 补基线、§5.4 收回结论、§5.5 关闭 (a)(c) 并新增 (d)、§5.6 重排）
+- 日期：2026-09-01；**修订 2026-09-02**（§4.3 补基线、§5.4 两次收回结论并给出实测、
+  §5.5 关闭 (a)(c) 并新增 (d)、§5.6 重排）
 - 分支：`dsv4-moe-dspark-trainable`
 - 核验对象：
   - `fg11991/vllm-ascend`，分支 `vllm-0.27-dsv4`，commit `dedbb34`
@@ -25,9 +26,12 @@
    特征契约（§4.1）、warm start、学习率已排除；serving 路径这边，(a) draft config 已用
    两份真实 config 逐条算完**排除**、(c) 权重落位**基本关闭**，只剩 (b) 未量化路径
    ——但沿着 `quant_config is None` 挖了一层，找不到任何可指名的机制
-   （2026-09-02 对齐 `dedbb34` / `3d04f15`）。现存最强嫌疑是 §5.5(d)：**router 的
-   `gate.bias` 在 100 步里被无梯度的负载均衡更新推了最多 ±0.1，而 cosine 对这种改动
-   是结构性地盲的**——它改的是每个 token 走哪 6 个 expert，一个权重矩阵都不用动。
+   （2026-09-02 对齐 `dedbb34` / `3d04f15`）。**嫌疑已经转回权重侧**，因为原来
+   排除权重的那个 median cosine 是 fp32 累加造成的数值假象（§5.4，事实 22）。
+   实测两处损伤：`gate.bias` 被无梯度的负载均衡更新推满 ±0.1，扰动 rms 是官方分布
+   宽度的 34%~72%，等于把每个 expert 在路由排序里挪 70~77 个名次（§5.5(d)，事实 25）；
+   以及微调对每个张量施加了 ~0.005 的**绝对**位移，对小量级参数就是重写——
+   `mtp.2.hc_head_fn` 动了 29.4%（§5.4.2，事实 23/24）。
 5. 次要风险已定性：声明为 FP32 的 27 个参数里，24 个在**训练全程**就是 BF16
    （FSDP1 的 flat-param 约束所致），但运算全程上采、`gate.bias` 已被单独保住，serving 无影响（§4.2）。
 
@@ -53,11 +57,16 @@
 | 14 | 训练与 serving 的 aux 特征契约**完全一致**（层 40/41/42 的输出、`mean(dim=1)` 折叠、`main_norm(main_proj)`） | 见 §4.1 的逐项对照 | 源码 |
 | 15 | 独立 draft 目录能真正拉起服务 | 2026-09-02 在 A2 八卡上起来了，`--speculative-config` 带 `"model"` | 实测 |
 | 16 | 该 drafter 的接受率 pos0 = 4.6%（20/439），pos1-6 全 0 | `/metrics`，见 §5 | 实测 |
-| 17 | 导出件与官方 `mtp.*` 的 median cosine = 0.99988（min 0.95958） | `compare_draft_to_official.py` | 实测 |
+| 17 | ~~导出件与官方 `mtp.*` 的 median cosine = 0.99988~~ **该数值无效**，见事实 22 | `compare_draft_to_official.py`（修复前） | 已作废 |
 | 18 | BF16 draft 的线性/MoE 层**不受** vLLM"未初始化权重"检查保护 | `default_loader.py:455-465` 对有 `process_weights_after_loading` 的模块跳过检查；两个 Unquantized method 都有 | 源码 |
 | 19 | 同机官方 same-checkpoint drafter 的 7 步平均接受率约 60% | 用户在 A2 八卡实测，`num_speculative_tokens=7` | 实测 |
 | 20 | 独立目录与 same-checkpoint 的 draft-config **有效值**逐条相同 | 两份真实 `config.json` 走完各自的解析链，见 §5.5(a) | 实测+源码 |
 | 21 | `mtp.*.ffn.gate.bias` 每个 optimizer step 被无梯度地加 ±0.001 | `deepseek_v4_dspark.py:669-681`，与 lr/梯度无关 | 源码 |
+| 22 | 修复前脚本的 cosine 列在大张量上**系统性失真**（fp32 累加） | 逐位相同的 `mtp.0.embed`/`mtp.2.head` 报 1.18 / 1.22；本地复现 `cos(a,a)`：1e6→1.00007、1e7→1.0017、1e8→1.060 | 实测 |
+| 23 | 微调对**每个**张量的绝对位移都在 0.004~0.011，与该张量自身量级无关 | 官方 absmax 从 0.059 到 17.1 跨 290 倍，`max_abs_diff` 只跨 2 倍；≈ Adam 的 Σlr（100 步 × 2e-4 带 warmup/衰减） | 实测 |
+| 24 | `mtp.2.hc_head_fn` 相对 L2 偏差 **29.4%** | `official_absmax` 0.0587、`max_abs_diff` 0.0037 | 实测 |
+| 25 | `gate.bias` 漂移吃满上界：max\|Δ\| = 0.107/0.107/0.115，rms = 0.062/0.061/0.057 | 官方 std = 0.086/0.169/0.168 → 扰动是官方分布宽度的 **72%/36%/34%**；相邻名次间距中位数 0.0010，平均挪动 **70/72/77 个名次**（共 256） | 实测 |
+| 26 | 训练侧接受率 step 1 就有 60~70%，100 步内没有下降，梯度正常 | 用户回忆，**原始日志已丢失**，未能复核 | 用户口述 |
 
 补充事实（用户提供）：训练已跑通并导出；warm start 用的就是
 `DeepSeek-V4-Flash-0731-w8a8` 里的 `mtp.*`（即 INT8 反量化的起点）；
@@ -370,34 +379,70 @@ vllm:spec_decode_num_accepted_tokens_per_pos{pos=1..6}  0
 - **dtype**（§4.2）：24 个参数是 BF16，但运算全程上采，且 serving 侧还会再上采一次。
   这个量级的偏差不可能把 88% 打到 4.6%。
 
-### 5.4 cosine 排除了什么、没排除什么（2026-09-02 修订）
+> 2026-09-02：这一节曾经还列着"权重是对的"。已删——见 §5.4，那条依据是数值假象。
 
-`scripts/compare_draft_to_official.py` 的结果：
+### 5.4 那个 median cosine 是数值假象（2026-09-02 二次修订）
+
+本文初版在这里写"median cosine 0.99988，这个 drafter 实质上就是官方 drafter，
+所以问题在 serving 路径"。**这个数字本身是错的，结论随之作废。**
+
+#### 5.4.1 cosine 列在大张量上失真
+
+`--output` 导出明细后，两行直接证伪了这一列：
 
 ```
-verdict        : warm start held; the drafter is a fine-tune of the official one
-median_cosine  : 0.99988
-min_cosine     : 0.95958
+mtp.0.embed.weight   cosine=1.1846   relative_l2=0.0   max_abs_diff=0.0
+mtp.2.head.weight    cosine=1.2202   relative_l2=0.0   max_abs_diff=0.0
 ```
 
-median cosine 0.9999 对应的相对偏差约 `√(2×1e-4) ≈ 1.4%`。它**确实**排除了两件事：
+两个张量与官方**逐位相同**，cosine 却报 1.18 / 1.22。余弦相似度不可能大于 1。
+误差按元素数单调：5.3 亿 → 1.18~1.22；5000 万（`main_proj`）→ 1.0078；
+3300 万（`markov_w*`）→ 1.003；百万级 → 1.000x；几万以下 → 准确。
 
-- **嫌疑 1（warm start 没生效）排除** —— 随机初始化的 cosine 会在 0 附近。
-- **嫌疑 2（学习率毁了它）排除** —— 每个权重矩阵都几乎没动。100 步 × 5e-5 的位移
-  在数值上确实是小的，之前那个 16% 是上界、实际远小于它。
-- **嫌疑 3（100 步太少）也不成立** —— 起点就是官方权重，"训得少"只意味着
-  接近官方，不意味着退化。
+机理：`cosine_similarity` 要在 fp32 里累加 `sum(x*x)`。5.3 亿个 ~4e-4 量级的项累加到
+~2e5 之后，fp32 在该量级的 ulp 是 0.0156，**后续项整个被吞掉**，两个范数被系统性低估，
+商就大于 1。本地复现（`cos(a, a)`，理论值恒为 1）：
 
-**但它没有排除"权重变了"这个类别本身。** 本文初版在这里下了"问题不在权重、在
-serving 路径"的结论，那一步跨大了：cosine 是逐张量、且对**尺度不变**的相似度，
-它衡量的是"每个矩阵还是不是原来那个矩阵"，衡量不了"这些矩阵还会不会被同样地用到"。
-DSpark 里恰好有一组参数属于后者——router 的 `gate.bias`，768 个数，
-它决定每个 token 走哪 6 个 expert，而且是被一条**与梯度、与学习率都无关**的规则
-每个 optimizer step 推一次的。见 §5.5(d)。
+| 元素数 | 1e6 | 1e7 | 1e8 |
+| --- | ---: | ---: | ---: |
+| fp32 `cosine_similarity` | 1.000069 | 1.001731 | 1.060107 |
 
-`compare_draft_to_official.py` 其实已经逐张量算了 `relative_l2` / `max_abs_diff` /
-`official_absmax`，只是 verdict 只汇总了 cosine。用 `--output` 把明细导出来、按
-`relative_l2` 排序，才是这一步该有的判据。
+`relative_l2` 走的是 `.norm()`（更稳的归约核），所以**它是准的**——那两行的 0.0 就是
+它给的。脚本已修：所有归约改为 float64 分块累加，verdict 改用 `relative_l2`，
+并补了单测（`tests/test_scripts/test_compare_draft_to_official.py`）。
+
+#### 5.4.2 可信的那两列讲了另一个故事
+
+把 `max_abs_diff` 按张量自身量级排开：
+
+| 张量 | official_absmax | max_abs_diff | relative_l2 |
+| --- | ---: | ---: | ---: |
+| `mtp.2.hc_head_fn` | 0.0587 | 0.0037 | **0.294** |
+| `mtp.0.attn_norm.weight` | 0.0884 | 0.0044 | 0.0255 |
+| `mtp.0.main_norm.weight` | 0.0894 | 0.0044 | 0.0153 |
+| `mtp.0.ffn.shared_experts.w1` | 0.746 | 0.0066 | 0.0258 |
+| `mtp.1.attn.wkv.weight` | 1.876 | 0.0059 | 0.0156 |
+| `mtp.2.markov_head.markov_w1` | 17.125 | 0.0078 | 0.00042 |
+
+**张量量级跨了 290 倍，绝对位移全挤在 0.004~0.011。** 这是 Adam 的指纹，不是
+"按需调整"的样子：Adam 把梯度归一化掉，每步位移约等于 lr，与参数自身大小无关。
+recipe 的 `learning_rate: 2.0e-4`、warmup 4 步、100 步衰减完，Σlr ≈ 0.005~0.01,
+和观测值吻合。
+
+后果是不对称的：同样的 0.005，对大矩阵是 1.2~2.6% 的相对变化（cosine 更是看不见），
+对**小量级参数**就是重写。`mtp.2.hc_head_fn` 动了 **29.4%**——它是 head 侧 mHC 的混合
+矩阵，`F.linear(flat, hc_head_fn.float())` 之后过 20 轮 Sinkhorn，直接决定喂给 lm_head
+的隐状态怎么由 4 条 hc 流合成。三个 RMSNorm 权重也各动了 2.4~2.6%。
+
+#### 5.4.3 修订后的结论
+
+- **嫌疑 1（warm start 没生效）仍然排除** —— `relative_l2` 中位数 0.018，
+  随机初始化会在 √2 ≈ 1.41 附近。这一条不依赖 cosine。
+- **嫌疑 2（训练把它推走了）没有被排除**，恰恰相反：5.4.2 是它的正面证据。
+- **嫌疑 3（100 步太少）也要重新看** —— 步数少不等于位移小；对 `gate.bias` 更是
+  完全相反，见 §5.5(d)。
+- 因此"问题不在权重"这句话收回。(b) 那条未量化路径的嫌疑同步下降：解释 4.6%
+  不再需要它。
 
 ### 5.5 独立目录 vs same-checkpoint：全部差异
 
@@ -555,41 +600,76 @@ self.bias.add_(torch.sign(target - counts).to(self.bias) * self.bias_update_rate
   但它保住的是**精度**，恰恰保证了每步 ±0.001 完整累加进去，不被 BF16 的
   round-to-nothing 吃掉。
 
-它同时解释了 §5.4 那个别扭之处：官方同权重 60%、我们 4.6%——因为两边并不是同一份
-权重，而这 768 个数是唯一一组"L2 改动极小、功能上非线性放大"的参数。
+#### 实测的漂移量（2026-09-02）
 
-验证两步，第一步秒级：
+三个 bias 与官方逐元素比对（导出件里的旧值从 `gate_bias_backup.json` 取）：
 
-```bash
-python scripts/compare_draft_to_official.py \
-    --draft-dir    /sharenfs/w00958190/dsv4-dspark/0901_export/deepseek-v4-flash-dspark-export \
-    --official-dir /sharenfs/DeepSeek-V4-Flash-0731-w8a8 \
-    --output /tmp/cmp.json
-```
+| | max\|Δ\| | Δ 的 rms | 官方 std | rms / 官方 std | 平均挪动名次（共 256） |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `mtp.0.ffn.gate.bias` | 0.1074 | 0.0615 | 0.0859 | **72%** | 69.7 |
+| `mtp.1.ffn.gate.bias` | 0.1073 | 0.0609 | 0.1693 | 36% | 71.9 |
+| `mtp.2.ffn.gate.bias` | 0.1149 | 0.0566 | 0.1679 | 34% | 77.0 |
 
-按 `relative_l2` 排序看前 20，并单独看三个 `mtp.{0,1,2}.ffn.gate.bias`。判据：
-它们的 `max_abs_diff` 是否 ≈ 0.1（= 100 × 0.001，说明每个元素都吃满了），
-以及相对 `official_absmax` 有多大；`min_cosine` 那一项是不是它们之一。
+三条读法：
 
-第二步：把官方的三个 `gate.bias` **原地覆回**导出件再起一次。dtype（F32）和
-shape（[256]）都不变，可以按 safetensors 的字节偏移直接打补丁，不必重写那 38.9 GiB
-（记得先把旧字节备份下来）。接受率跳回 60% 量级即定案。
+1. **max\|Δ\| ≈ 0.107~0.115，正好是 100 × 0.001 的上界**——每个元素都被推满了，
+   `sign()` 在整个训练里几乎没翻过号，说明这批数据的负载分布与官方的稳态差得很远。
+2. **扰动的 rms 是官方分布宽度的 34%~72%。** 之前用 absmax（3.17/3.32/4.29）估
+   "只有 3%" 是错的：absmax 是少数几个离群 expert 撑起来的，主体分布的 std 只有
+   0.086~0.169，±0.1 的噪声在这个尺度上是巨量。
+3. 官方 bias 排序后相邻名次的间距中位数只有 **0.0010**，所以平均 \|Δ\| 相当于把每个
+   expert 在排序里挪动 **70~77 个名次**。top-6 选择因此被大面积重排——**用漂移过的
+   路由器去选一组没动过的专家**。
 
-若确认，短期微调的正式做法是把 `router_bias_update_rate` 设为 0，或让它按 token 数
-而非 optimizer step 数缩放——而不是每次导出后手工覆盖。
+#### 与训练侧指标的矛盾（未解决）
+
+用户回忆：训练侧接受率 step 1 就有 60~70%，100 步内**没有下降**（事实 26，
+原始日志已丢失，无法复核）。这与 serving 的 pos0 = 4.6% 直接冲突——pos0 本质上就是
+teacher-forced 的"给定真实上文预测下一个 token"，和训练指标测的是同一件事。
+
+两条出路，只能靠实验分：
+
+- 训练指标对这种损伤不敏感（例如 routed expert 只贡献了一部分，
+  attention + shared expert 撑住了 teacher-forced 的分布）；
+- 或者用户的回忆不精确。
+
+无论哪种，下面这个 A/B 都能定案。
+
+#### 验证
+
+第一步**已做**：三个官方 `gate.bias` 已按 safetensors 字节偏移原地覆回导出件，
+旧值备份在 `/sharenfs/w00958190/dsv4-dspark/0901_export/gate_bias_backup.json`。
+**导出目录现在是"官方 router + 微调过的其余部分"的混合体**，之后任何一次起服务
+测的都是这个混合体。
+
+第二步：起服务，同一组 prompt 测接受率。
+
+- 跳回 60% 量级 → (d) 定案；
+- 只涨一点或没涨 → router 不是主因，损伤在 §5.4.2 那批"绝对位移"里
+  （首先是 `hc_head_fn`），走 §5.6 的 identity export。
+
+若 (d) 定案，短期微调的正式做法是把 `router_bias_update_rate` 设为 0，或让它按
+token 数而非 optimizer step 数缩放——而不是每次导出后手工覆盖。
 
 ### 5.6 下一步（按成本）
 
-前提已经变了：官方基线拿到了（事实 19，7 步平均约 60%），(a) 已排除，(c) 基本关闭。
+前提已经变了：官方基线拿到了（事实 19），(a) 已排除，(c) 基本关闭，(b) 找不到机制，
+而权重侧冒出两处实打实的损伤（事实 24、25）。
 
-1. **`compare_draft_to_official.py --output` + 按 `relative_l2` 排序**（秒级、离线）。
-   直接判 (d)：三个 `gate.bias` 的 `max_abs_diff` 是不是 ≈ 0.1。
-2. **把官方的三个 `gate.bias` 覆回导出件，重起一次**（一次服务，十分钟级）。
-   - 跳回 60% 量级 → (d) 定案，回训练侧改 `router_bias_update_rate`；
-   - 没跳 → 权重侧彻底洗清，落回 (b)：把 drafter 也量化成 W8A8 放进独立目录（§6），
-     让两条路除权重外完全一致。这本来就是第二步要做的事，只是提前成为定位手段。
-3. **训练日志 step 1 的 `acceptance_rate_*`**，以及两次服务日志的
-   `DSpark draft model loaded: N params` 对比（都免费，一直欠着）。
+1. **起一次服务测已打过补丁的导出件**（官方 router + 微调其余部分）。
+   这是 (d) 的直接 A/B，文件已经改好了，只差跑一次。
+2. **Identity export A/B** —— 现在这才是把剩余空间一刀切开的实验。不训练，直接用
+   warm-start 路径把官方 `mtp.*` 物化成 BF16 draft 目录
+   （`AutoDraftModel.from_config` + `load_official_checkpoint` + `save_pretrained`
+   + `prepare_dspark_serving_config.py`），按 §2.3 起服务、同一组 prompt。
+   - ≈60% → 独立目录 + BF16 这条 serving 路径证明是好的，4.6% 全部记在微调头上，
+     (b) 出局，去查训练（lr、mHC 是否该冻结、`router_bias_update_rate`）；
+   - ≈4.6% → 微调无辜，问题就在 (b)，§6 的 W8A8 导出从"第二步"变成必须。
+   注意第 1 步之前做完这一步也行——它不依赖 (d) 的结果，且信息量更大。
+3. **重跑修好的 `compare_draft_to_official.py`**（秒级）。现在它比 50 个张量，
+   覆盖 `gate.bias`、每个 EP rank 各一个 expert、以及全部 hc 小张量，
+   verdict 走 `relative_l2`，并直接打印 `worst_by_relative_l2`。
+4. 两次服务日志的 `DSpark draft model loaded: N params` 对比（免费，仍欠着）。
 
 ## 6. 第二步：量化
 
@@ -625,27 +705,28 @@ draft 目录里有 description 就被识别为 ModelSlim（`quantization/utils.p
 
 **先做（不上机）**
 
-1. **§5.5(d) 的第一步**：`compare_draft_to_official.py --output` 之后按
-   `relative_l2` 排序，看三个 `gate.bias` 的 `max_abs_diff` 是不是 ≈ 0.1。
-   **这一条决定 4.6% 是 router 漂移还是别的。**
-   顺带把一直欠着的两条拿掉：训练日志 step 1 的 `acceptance_rate_*`、
-   serving 日志的 `DSpark draft model loaded` 计数（两种模式各一次）。
-2. ~~4.1 的 mHC 折叠比对~~ / ~~4.2 的 dtype 诊断~~ —— 都已完成，见对应小节。
-3. ~~导出侧写死 serving 用的 config 字段~~ —— 已完成：
+1. ~~§5.5(d) 的第一步~~ —— 已做，结果见 §5.5(d) 的实测表（`max|Δ|` 吃满上界）。
+   顺带修好了 `compare_draft_to_official.py`（float64 归约、覆盖 `gate.bias`
+   与每个 EP rank、verdict 改用 `relative_l2`、加单测）。
+2. **Identity export**：不训练，把官方 `mtp.*` 物化成 BF16 draft 目录，
+   作为 §5.6 第 2 步的输入。这是现在信息量最大的一件事，且不占卡。
+3. ~~4.1 的 mHC 折叠比对~~ / ~~4.2 的 dtype 诊断~~ —— 都已完成，见对应小节。
+4. ~~导出侧写死 serving 用的 config 字段~~ —— 已完成：
    `scripts/prepare_dspark_serving_config.py`（含 8 个单测）。放在导出之后而不是
    `DeepseekV4DSparkConfig` 里，是因为训练侧要靠 `architectures` 解析模型类，
    `export_to_hf` 的输出也要能被 `from_pretrained` 读回。
 
 **上机**
 
-4. ~~官方 drafter（same-checkpoint）的接受率基线~~ —— 已测，7 步平均约 60%（事实 19）。
-5. ~~跑 §2.3 的命令~~ —— 已跑，结果见 §5。
-6. **把官方的三个 `gate.bias` 覆回导出件重起一次**（§5.5(d) 第二步），
-   这是目前唯一能一次定案的实验。
+5. ~~官方 drafter（same-checkpoint）的接受率基线~~ —— 已测，7 步平均约 60%（事实 19）。
+6. ~~跑 §2.3 的命令~~ —— 已跑，结果见 §5。
+7. **起服务测已打过补丁的导出件**（官方 router + 微调其余部分，文件已改好）。
+8. **起服务测 identity export**（§5.6 第 2 步）——把"训练毁的"和"serving 路径毁的"
+   一刀切开。
 
 **之后**
 
-7. §6 的量化导出器。若 (d) 不成立，它同时是 (b) 的定位手段。
+9. §6 的量化导出器。若 identity export 也低，它同时是 (b) 的定位手段。
 
 ---
 
@@ -655,9 +736,12 @@ draft 目录里有 description 就被识别为 ModelSlim（`quantization/utils.p
 2. 显存与吞吐未测；本 drafter 的接受率仍只有 4.6% 这一个数据点
    （官方基线已补，见事实 19）。
 3. ~~`captured.mean(dim=1)` 的正确性~~ —— 已排除（§4.1）。
-4. §5.5(d) 是**假设**，不是结论：`gate.bias` 的实际漂移量、以及它相对官方量级有多大，
-   都还没测；覆盖回官方值的 A/B 也还没做。这两步做完之前，不要把它当定论。
-5. 容器里实际安装的 `vllm_ascend` 是否逐字等于 `dedbb34`。用户确认用的是
+4. §5.5(d) 的**漂移量已测**（事实 25），但"漂移 ⇒ 4.6%"这一步仍是推断：
+   覆盖回官方值的 A/B 还没起过服务。同样地，§5.4.2 的 Adam 位移是实测，
+   "位移 ⇒ 4.6%" 也还没有实验支撑。两者都要等 §5.6 的第 1、2 步。
+5. 事实 26（训练侧接受率 60~70% 且未下降）来自用户回忆，原始日志已丢失，
+   **没有复核过**。它与 pos0 = 4.6% 存在直接矛盾，见 §5.5(d) 末尾。
+6. 容器里实际安装的 `vllm_ascend` 是否逐字等于 `dedbb34`。用户确认用的是
    `fg11991/vllm-ascend@vllm-0.27-dsv4` 和 `fg11991/vllm@vllm-0.27-dsv4`，
    本文按此为准；但启动脚本里的 `VLLM_ASCEND_APPLY_DSV4_PATCH=1` 在这两个仓库里
    都搜不到读取处，该变量应为空转（DSpark patch 由
