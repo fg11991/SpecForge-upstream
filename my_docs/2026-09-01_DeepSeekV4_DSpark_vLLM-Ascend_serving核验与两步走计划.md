@@ -8,8 +8,8 @@
 - 方法：静态读两边源码，**加上 A2 容器与共享盘上的五条实测**（§1 逐条标注）。
 - **本文取代同日初版（`68c4b64`）**。初版是纯静态推断，其中四节已被实测推翻或收窄：
   description key 的担忧（不成立）、导出件疑似缺 expert（不成立）、
-  `architectures` 必须手改（不必要）、独立 draft 目录没有先例所以排后（应该排第一）。
-  旧版在 git 历史里。
+  独立 draft 目录没有先例所以排后（应该排第一）、以及只提 `architectures` 而漏了
+  `model_type`（后者才是硬性的，见 §2.2）。旧版在 git 历史里。
 
 ---
 
@@ -18,8 +18,8 @@
 1. **走独立 draft 目录**。`load_dspark_model` 用
    `get_model(vllm_config=draft_vllm_config, model_config=draft_model_config)`
    建 draft，权重从 draft 自己的路径加载——这条路是支持的，不用碰 target 目录。
-2. **导出件是完整的**，`config.json` 基本不用改：vLLM 会自己把 `architectures`
-   覆写成 `DSparkDraftModel`、`model_type` 覆写成 `deepseek_v4`。
+2. **导出件是完整的**，但 `config.json` 必须改三个字段，其中 `model_type` 是硬性的
+   ——vLLM 那段自动覆写发生在 `ModelConfig` 构造之后，救不了构造阶段的解析失败（§2.2，实测）。
 3. **ModelSlim warm start 是对的**：description 的 key 就是磁盘张量名（实测 7022/7022）。
 4. **剩下真正的风险不在 serving，在特征**：SGLang capture patch 里的
    `captured.mean(dim=1)` 这个 mHC 折叠**从未与官方实现对过**。它错了的话，
@@ -38,7 +38,7 @@
 | 4 | same-checkpoint DSpark 服务本来就能跑起来 | 用户在 A2 八卡上以 `--quantization ascend` + `{"method":"dspark","num_speculative_tokens":7}` 拉起过 | 实测 |
 | 5 | `/dpc/hot/x00873006/...` 与 `/sharenfs/...` 是同一份 checkpoint | 用户确认 | 实测 |
 | 6 | 独立 draft 目录被支持 | `vllm/v1/worker/gpu/spec_decode/dspark/utils.py::load_dspark_model` 用 `model_config=draft_model_config` 调 `get_model` | 源码 |
-| 7 | draft 的 `architectures` / `model_type` 由 vLLM 强制覆写 | `vllm/config/speculative.py:954-963` | 源码 |
+| 7 | draft 的 `architectures` / `model_type` 由 vLLM 强制覆写，但**太晚**——`ModelConfig` 先构造先失败 | `vllm/config/speculative.py:954-963`；实测报错见 §2.2 | 源码+实测 |
 | 8 | 独立路径下 draft 不继承 target 量化 | `speculative.py:703` 的 `self.model is None` 分支不触发 → `self.quantization` 保持 None；`patch_dspark.py` 的 `draft_model_config.model == model_config.model` 也不成立 | 源码 |
 | 9 | drafter 会保留自己的 embed/head | `spec_decode/eagle/utils.py:12-25` 的 `_should_share`：draft 有自己的且与 target 不相等就不共享 | 源码 |
 | 10 | draft 层用 target 的 hf_config | `vllm_ascend/models/deepseek_v4/model.py:656-657` | 源码 |
@@ -88,18 +88,43 @@ deepseek-v4-flash-dspark-export/
 > 就是这个文件存不存在。链进去等于声明这个 BF16 draft 是量化的，
 > 然后拿 target 的标签去查我们的 BF16 权重。
 
-`config.json` 建议改两个字段——vLLM 反正会覆写 `architectures`，但覆写发生在
-`ModelConfig` 构造**之后**，写对了可以避免构造阶段就在注册表里查不到：
+`config.json` 必须改三个字段：
 
 ```json
+"model_type": "deepseek_v4",
 "architectures": ["DSparkDraftModel"],
 "n_mtp_layers": 3
 ```
 
+**`model_type` 是硬性的，不改起不来**（实测）。`deepseek_v4_dspark` 不在
+transformers 也不在 vLLM 的配置注册表里（`vllm/transformers_utils/config.py:89`
+只有 `deepseek_v4`），`ModelConfig` 在构造阶段就抛：
+
+```
+Error parsing config for <draft dir>: The checkpoint you are trying to load has
+model type deepseek_v4_dspark but Transformers does not recognize this architecture.
+...
+pydantic_core.ValidationError: 1 validation error for SpeculativeConfig
+```
+
+`speculative.py:954-963` 那段"自动把 `model_type` 设成 `deepseek_v4`、
+`architectures` 设成 `DSparkDraftModel`"的代码在 `SpeculativeConfig.__post_init__`
+里，**比 `ModelConfig` 构造晚**，救不了这个错。所以这两个字段要在导出侧就写对，
+不能指望 vLLM 覆写。
+
+改成 `deepseek_v4` 是安全的：`vllm/transformers_utils/configs/deepseek_v4.py` 的
+`DeepseekV4Config` 总共 23 行，只显式接 `max_position_embeddings` / `rope_scaling` /
+`rope_parameters` / `rope_theta`，其余全部走 `**kwargs` 变成属性——没有必填字段、
+没有校验器，我们的 `dspark_*` 字段原样保留，缺的字段也不会报错（三个 DSpark 层
+读的是 target 的 config）。
+
 `n_mtp_layers` 是 `vllm_ascend/models/deepseek_v4/dspark.py:65-69` 的首选字段
 （其次 `dspark_num_mtp_layers`，再默认 3）。我们导出的是 `dspark_num_layers`，
-目前靠默认值蒙对，写死更稳。其余字段保持原样，包括那两坨 yarn 参数
-（是死字段，draft 层读的是 target config）。
+靠默认值蒙对，写死更稳。
+
+其余字段保持原样。**若下一步撞上 rope 相关的 KeyError**，删掉整个 `rope_scaling`
+字段：`DeepseekV4Config` 取的是 `rope_scaling or rope_parameters`，而我们那个 yarn
+dict 里没有 `rope_theta`；DSpark 层不用 yarn，删掉即可让 `rope_parameters` 生效。
 
 ### 2.3 启动命令
 
