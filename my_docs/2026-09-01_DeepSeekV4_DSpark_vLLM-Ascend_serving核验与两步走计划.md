@@ -353,19 +353,44 @@ vllm:spec_decode_num_accepted_tokens_per_pos{pos=1..6}  0
 
 ### 5.4 嫌疑排序
 
-1. **warm start 没有真正生效。** 若 `model.draft_checkpoint_path` 没配到，
-   `build_registered_draft`（`model_providers.py:201-204`）的
-   `_specforge_skip_initialization` 也为假，模型就是**随机初始化**，
-   100 步从零训出来的正是"退化输出"这个量级。
-2. **训练把它推走了。** 学习率对一个已收敛的模型过大，100 步足够毁掉一个好起点。
-3. 100 步本身太少——但这只在 1 成立时才是主因；warm start 生效的话，
-   100 步不该让接受率掉到 4.6%。
+**嫌疑 1：warm start 没有真正生效。** 追完 `_finish_registered_draft`
+（`model_providers.py:158-190`）的三条分支，只有一条是静默的：
+
+| 条件 | 行为 |
+| --- | --- |
+| 路径已配 且 不是 SpecForge checkpoint | `load_official_checkpoint` —— 缺任何权重都**抛错**，不会静默 |
+| 路径已配 且 是 SpecForge checkpoint | `warm_start_draft_model` —— 同样会报 |
+| **路径为空** | `_warm_start`（`:71-72`）**直接 return，什么都不打** → 随机初始化 |
+
+也就是说，只要 `model.draft_checkpoint_path` 配到了，warm start 要么成功要么报错；
+一旦为空，整个 run **没有任何证据**说明权重是随机的。100 步从零训出来的正是
+"退化输出"这个量级。
+
+> 已修（本次提交）：三条分支现在都打日志，第三条打的是 `WARNING ... RANDOM
+> INITIALISATION`。以后翻一眼日志就能定这件事，不用再靠权重比对反推。
+
+**嫌疑 2：学习率对一个已收敛的模型过大。** recipe 里是
+`learning_rate: 2.0e-4`、`warmup_ratio: 0.04`、`max_steps: 10000`，
+所以 warmup 是 400 步，step 100 时 lr ≈ `2e-4 × 100/400 = 5e-5`。
+AdamW 每元素每步的位移量级约等于 lr，累计上界
+`Σ lr_t ≈ 5e-7 × Σ_{t≤100} t ≈ 2.5e-3`；而 4096 宽线性层的权重标准差约
+`1/√4096 ≈ 0.0156`。**上界相当于 16% 的相对位移**，而这期间只看过
+`1 × 4 × 100 = 400` 条序列。这个 lr 是 EAGLE3 从零训的默认值，
+不是给"微调一个已收敛的官方 drafter"用的。
+
+（这是上界，梯度方向会互相抵消，所以它单独未必能把 88% 打到 4.6%；
+但和嫌疑 1 叠加时它会放大后果。）
+
+**嫌疑 3：100 步太少。** 只在嫌疑 1 成立时才是主因——warm start 生效的话，
+100 步不该让接受率掉到 4.6%。
 
 ### 5.5 判据（按成本从低到高，做完 1-3 再上卡）
 
 1. **训练日志里 step 1 的 `accuracy`（免费）。** warm start 生效的话，
    第一步的 accuracy 就该是高值；若从 ~0 开始往上爬，说明是从随机权重学起的，
-   嫌疑 1 直接坐实。
+   嫌疑 1 直接坐实。**注意 recipe 的 `log_interval: 20`**——第一条打印出现在
+   step 20，不是 step 1；重跑时用 `training.log_interval=1`。
+   顺带确认当时那个 run 的 `model.draft_checkpoint_path` 到底配的是什么。
 2. **serving 日志里 `DSpark draft model loaded: N params`（免费）。**
    记下 N，确认没有大批权重没落位。
 3. **离线比对导出件与官方权重**：

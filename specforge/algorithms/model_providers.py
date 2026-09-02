@@ -22,8 +22,11 @@ remain inside callables so resolving the algorithm registry stays import-light.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -172,8 +175,32 @@ def _finish_registered_draft(
         # A pruned Markov output needs the target-id rows while the official
         # fused checkpoint is being dequantized, so install the mapping first.
         _load_vocab_mapping(cfg, draft_model)
-        load_official(cfg.model.draft_checkpoint_path)
+        loaded = load_official(cfg.model.draft_checkpoint_path)
+        logger.info(
+            "%s warm start: loaded %s tensors from the official checkpoint %s",
+            type(draft_model).__name__,
+            loaded,
+            cfg.model.draft_checkpoint_path,
+        )
     else:
+        if load_official is not None and not cfg.model.draft_checkpoint_path:
+            # This drafter exists as a released checkpoint, and a from-scratch
+            # run of it is not a thing anyone asks for on purpose: the released
+            # weights are the whole starting point. Silence here is what makes a
+            # forgotten path look like a training problem later, so say it.
+            logger.warning(
+                "%s is being trained from a RANDOM INITIALISATION: "
+                "model.draft_checkpoint_path is unset, so neither the official "
+                "checkpoint nor a SpecForge checkpoint was loaded. Set it to the "
+                "released checkpoint unless training from scratch is intended.",
+                type(draft_model).__name__,
+            )
+        elif cfg.model.draft_checkpoint_path:
+            logger.info(
+                "%s warm start: from the SpecForge checkpoint %s",
+                type(draft_model).__name__,
+                cfg.model.draft_checkpoint_path,
+            )
         _warm_start(cfg, draft_model, draft_config)
         # Same order as EAGLE3: warm-started buffers are then overwritten by the
         # run's own mapping, so an explicit path always wins over the checkpoint.
