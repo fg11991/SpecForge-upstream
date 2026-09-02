@@ -21,9 +21,8 @@
 2. **导出件是完整的**，但 `config.json` 必须改三个字段，其中 `model_type` 是硬性的
    ——vLLM 那段自动覆写发生在 `ModelConfig` 构造之后，救不了构造阶段的解析失败（§2.2，实测）。
 3. **ModelSlim warm start 是对的**：description 的 key 就是磁盘张量名（实测 7022/7022）。
-4. **剩下真正的风险不在 serving，在特征**：SGLang capture patch 里的
-   `captured.mean(dim=1)` 这个 mHC 折叠**从未与官方实现对过**。它错了的话，
-   drafter 学的是另一个目标，接受率不会好，而且和量化、和加载都无关。
+4. **首次上机跑通了，但接受率 4.6%，官方基线是 88%**（§5）。特征契约已逐行排除
+   （§4.1），嫌疑集中在 warm start 是否真的生效、以及 100 步训练是否把它训坏了。
 5. 次要风险已定性：声明为 FP32 的 27 个参数里，24 个在**训练全程**就是 BF16
    （FSDP1 的 flat-param 约束所致），但运算全程上采、`gate.bias` 已被单独保住，serving 无影响（§4.2）。
 
@@ -46,6 +45,9 @@
 | 11 | `mtp.0` → layer 43 → `compress_ratio=0` → SWA、theta 10000、不启 yarn | `vllm_ascend/utils.py:87-100,110-115`；`model.py:519-525` | 源码 |
 | 12 | 采到的 `last_hidden_states` 是最终 RMSNorm **之后**的 | capture patch 在 `self.norm(hidden_states)` 之后返回，并显式抑制 `hidden_states_before_norm`（patch 文档第 4 条） | 源码 |
 | 13 | W8A8 条目数闭合 | 2322 × 3 = 6966 `W8A8_DYNAMIC`，加 56 `FLOAT` = 7022 | 推导+实测 |
+| 14 | 训练与 serving 的 aux 特征契约**完全一致**（层 40/41/42 的输出、`mean(dim=1)` 折叠、`main_norm(main_proj)`） | 见 §4.1 的逐项对照 | 源码 |
+| 15 | 独立 draft 目录能真正拉起服务 | 2026-09-02 在 A2 八卡上起来了，`--speculative-config` 带 `"model"` | 实测 |
+| 16 | 该 drafter 的接受率 pos0 = 4.6%（20/439），pos1-6 全 0 | `/metrics`，见 §5 | 实测 |
 
 补充事实（用户提供）：训练已跑通并导出；warm start 用的就是
 `DeepSeek-V4-Flash-0731-w8a8` 里的 `mtp.*`（即 INT8 反量化的起点）；
@@ -242,23 +244,25 @@ config.json 用 target 的，我们导出的那个在这条路上完全用不上
 
 ## 4. 真正的风险清单（按影响排序）
 
-### 4.1 mHC 折叠 `mean(dim=1)` 从未对过官方实现 —— 最高
+### 4.1 ~~mHC 折叠~~ —— **已排除**（2026-09-02）
 
-`patches/sglang/v0.5.14/apply_deepseek_v4_capture.py` 自己写着：
+初版把这条列为最高风险：capture patch 自己写着 `captured.mean(dim=1)` 这个 mHC
+折叠"NOT VERIFIED HERE"。现在逐行对完了，**训练侧和 serving 侧完全一致**：
 
-> NOT VERIFIED HERE: that `captured.mean(dim=1)` is the fold the official V4
-> DSpark drafter consumes. It matches SpecForge's normalizer
-> (`_project_target_hidden`, which does `mean(dim=-2)`), but the mHC stream mean
-> is not the same operation as the learned `hc_head` fold.
+| | 训练（SGLang capture patch） | serving（vllm-ascend） |
+| --- | --- | --- |
+| 请求的层号 | `dflash_config.target_layer_ids` = `[40,41,42]` 原样（`model_providers.py:270-281`） | `tuple(i+1 for i in dspark_target_layer_ids)` = `(41,42,43)`（`model_runner_v1.py:675-689`） |
+| 捕获时机 | `if i in layers_to_capture` → 层 i 的**输出** | `if layer.layer_idx + 1 in aux_layers` → 层 `layer_idx` 的**输出**（`model.py:879-888`） |
+| 实际捕获 | **层 40/41/42 的输出** | **层 40/41/42 的输出** |
+| mHC 折叠 | `captured.mean(dim=1)` | `hidden_states.mean(dim=1)`（`model.py:888`） |
+| 三层拼接 | `LogitsProcessor` 沿最后一维拼成 `[T, 3H]` | `aux_hidden_states` 列表交给 draft |
+| 投影 | `_project_target_hidden`：`main_norm(main_proj(x))`（`:1259-1260`） | `combine_hidden_states`：`main_norm(main_proj(x))`（`dspark.py:201-202`） |
 
-采集侧把 `[T, hc_mult, H]` 的多流状态按 `mean` 折成 `[T, H]`，而官方 drafter 消费的
-可能是 `hc_head` 学出来的加权折叠。**两者不同的话，drafter 训练时看到的 target 特征
-和 serving 时 vLLM 喂给它的不是同一个东西**，接受率不会好，且这个失配在训练指标上
-看不出来（loss 会正常下降，只是在拟合一个错的目标）。
+两边的 `+1` 是对称的：serving 请求 `id+1` 再取"`layer_idx+1` 命中时的层输出"，
+净效果与我们"请求 id、取该层输出"相同。patch 里那句"Do not fix this to match V2"
+是对的。
 
-排查方式：拿官方 `inference/model.py` 的 `hc_head` 前向，和 capture 出来的
-`mean(dim=1)` 在同一批输入上比数值。这件事**应该在花力气做 serving 之前做**，
-因为它决定这个 drafter 值不值得上机。
+**特征契约不是接受率低的原因。**
 
 ### 4.2 24 个声明为 FP32 的参数在训练全程是 BF16 —— 中（已定性，非紧急）
 
@@ -307,11 +311,85 @@ vLLM-Ascend 把它们声明为 FP32，加载时 `copy_` 自动上采。
 
 ### 4.4 第二步的量化 —— 低
 
-见 §5。收益是显存/带宽，不是精度，晚做没有损失。
+见 §6。收益是显存/带宽，不是精度，晚做没有损失。
 
 ---
 
-## 5. 第二步：量化
+## 5. 首次上机结果（2026-09-02）与定位
+
+### 5.1 数据
+
+独立 draft 目录按 §2 起来了。跑了一批请求之后：
+
+```
+vllm:spec_decode_num_drafts_total                     439
+vllm:spec_decode_num_accepted_tokens_per_pos{pos=0}    20
+vllm:spec_decode_num_accepted_tokens_per_pos{pos=1..6}  0
+```
+
+| | 本 drafter | 官方 golden（e2e，w4a8/TP4，仅供量级参考） |
+| --- | ---: | ---: |
+| pos 0 | **4.6%**（20/439） | 0.88 |
+| pos 1-6 | 0 | 0.74 / 0.58 / 0.49 / 0.40 / 0.30 / 0.18 |
+
+### 5.2 这些数字说明什么
+
+**pos 1-6 全 0 不是额外信息。** 每位置接受率约 4.5% 的话，pos1 的期望命中次数是
+`439 × 0.045² ≈ 0.9`，观测 0 完全在噪声内。所以这不是"位置相关的 bug"，
+而是**每个位置都均匀地接近无效**。
+
+**4.6% 这个量级本身是有信息的。** 全随机 drafter 在 129280 词表下命中率约等于 0；
+而一个退化输出（总是给高频 token：空格、换行、常见标点）大致就能蹭到百分之几。
+所以现象是"**drafter 输出接近退化，不是稍弱**"——这把"训练不够、再多训点就好"
+这个解释排掉了：从官方权重 warm start 的模型不会退化成这样，除非起点就不对
+或者训练把它推走了。
+
+### 5.3 已排除的原因
+
+- **特征契约**（§4.1）：训练与 serving 两端的层号、mHC 折叠、投影逐行一致。
+- **加载路径**：服务能起来，说明 draft 目录被解析、权重被加载、未被误判为量化模型。
+- **dtype**（§4.2）：24 个参数是 BF16，但运算全程上采，且 serving 侧还会再上采一次。
+  这个量级的偏差不可能把 88% 打到 4.6%。
+
+### 5.4 嫌疑排序
+
+1. **warm start 没有真正生效。** 若 `model.draft_checkpoint_path` 没配到，
+   `build_registered_draft`（`model_providers.py:201-204`）的
+   `_specforge_skip_initialization` 也为假，模型就是**随机初始化**，
+   100 步从零训出来的正是"退化输出"这个量级。
+2. **训练把它推走了。** 学习率对一个已收敛的模型过大，100 步足够毁掉一个好起点。
+3. 100 步本身太少——但这只在 1 成立时才是主因；warm start 生效的话，
+   100 步不该让接受率掉到 4.6%。
+
+### 5.5 判据（按成本从低到高，做完 1-3 再上卡）
+
+1. **训练日志里 step 1 的 `accuracy`（免费）。** warm start 生效的话，
+   第一步的 accuracy 就该是高值；若从 ~0 开始往上爬，说明是从随机权重学起的，
+   嫌疑 1 直接坐实。
+2. **serving 日志里 `DSpark draft model loaded: N params`（免费）。**
+   记下 N，确认没有大批权重没落位。
+3. **离线比对导出件与官方权重**：
+
+   ```bash
+   python scripts/compare_draft_to_official.py \
+       --draft-dir    /sharenfs/w00958190/dsv4-dspark/0901_export/deepseek-v4-flash-dspark-export \
+       --official-dir /sharenfs/DeepSeek-V4-Flash-0731-w8a8
+   ```
+
+   它按 stage 抽 14 类张量 + 8 个 stage 专属张量，把官方侧的 W8A8 反量化后
+   逐张量算 cosine 和相对 L2，最后给一个判定：
+
+   | median cosine | 含义 |
+   | --- | --- |
+   | > 0.99 | warm start 生效，这是官方 drafter 的微调版 → 查嫌疑 2（学习率/目标函数） |
+   | 0.05 – 0.5 | 已经和官方没什么关系 |
+   | < 0.05 | **随机初始化**，warm start 从未生效 → 嫌疑 1 坐实 |
+
+4. **官方基线**（占卡）：用 same-checkpoint 模式跑同一组 prompt，
+   拿到这台机器上官方 drafter 的接受率。**这个数一直没测**，
+   没有它就无法排除"这台机器上官方也不高"。
+
+## 6. 第二步：量化
 
 独立 draft 目录让第二步比原计划干净：**把 description 放进 draft 目录自己**，
 不用碰 target。
@@ -341,21 +419,23 @@ draft 目录里有 description 就被识别为 ModelSlim（`quantization/utils.p
 
 ---
 
-## 6. 待办
+## 7. 待办
 
 **先做（不上机）**
 
-1. 4.1 的 mHC 折叠数值比对。**这是决定 drafter 值不值得上机的那一条。**
-2. 4.2 的两条 dtype 诊断。
+1. §5.5 的判据 1-3：训练日志 step 1 的 accuracy、serving 日志的
+   `DSpark draft model loaded` 计数、`compare_draft_to_official.py`。
+   **这三条决定 4.6% 是加载问题还是训练问题。**
+2. ~~4.1 的 mHC 折叠比对~~ / ~~4.2 的 dtype 诊断~~ —— 都已完成，见对应小节。
 3. ~~导出侧写死 serving 用的 config 字段~~ —— 已完成：
    `scripts/prepare_dspark_serving_config.py`（含 8 个单测）。放在导出之后而不是
    `DeepseekV4DSparkConfig` 里，是因为训练侧要靠 `architectures` 解析模型类，
    `export_to_hf` 的输出也要能被 `from_pretrained` 读回。
 
-**上机（一次服务跑两趟）**
+**上机**
 
-4. 先跑官方 drafter（same-checkpoint），记下接受率——这是基线。
-5. 再跑 §2.3 的命令，比同一组 prompt 的接受率。
+4. 官方 drafter（same-checkpoint）的接受率基线——仍然欠着，且现在更要紧了。
+5. ~~跑 §2.3 的命令~~ —— 已跑，结果见 §5。
 
 **之后**
 
@@ -363,14 +443,15 @@ draft 目录里有 description 就被识别为 ModelSlim（`quantization/utils.p
 
 ---
 
-## 7. 本文没有验证的
+## 8. 本文没有验证的
 
-1. §2 那条独立 draft 目录的启动命令**没有实跑过**。源码链条是通的，但
-   `ModelConfig` 构造阶段、KV cache 分配、`dspark_head` 的 compile tag 这些
-   都可能有没读到的分支。
-2. 接受率、显存、吞吐一律未测。
-3. `captured.mean(dim=1)` 的正确性（这正是 4.1）。
-4. 容器里实际安装的 `vllm_ascend` 是否逐字等于 `dedbb34`。用户确认用的是
+1. ~~启动命令没实跑过~~ —— 已跑通（§5）。
+2. 显存与吞吐未测；接受率只有这一个数据点，且**官方基线仍未测**——
+   没有它就无法断定 4.6% 是"训练毁了它"还是"这台机器上官方也不高"。
+3. ~~`captured.mean(dim=1)` 的正确性~~ —— 已排除（§4.1）。
+4. §5 那三条判据一条都还没跑，所以"warm start 没生效"目前只是嫌疑最大的假设，
+   不是结论。
+5. 容器里实际安装的 `vllm_ascend` 是否逐字等于 `dedbb34`。用户确认用的是
    `fg11991/vllm-ascend@vllm-0.27-dsv4` 和 `fg11991/vllm@vllm-0.27-dsv4`，
    本文按此为准；但启动脚本里的 `VLLM_ASCEND_APPLY_DSV4_PATCH=1` 在这两个仓库里
    都搜不到读取处，该变量应为空转（DSpark patch 由
