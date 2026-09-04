@@ -32,6 +32,27 @@ logger = logging.getLogger(__name__)
 STATE_FILE = "training_state.pt"
 
 
+def _load_rank_payload(path: str, map_location) -> Dict[str, Any]:
+    """Read one rank checkpoint, paging in only what the caller asks for.
+
+    Consolidation wants ``draft_state_dict`` and nothing else, but the file also
+    carries that rank's optimizer shard and RNG state — on a DSpark run the Adam
+    moments are fp32 and several times the bf16 weights beside them. ``mmap``
+    leaves every record a lazy view, so the moments are never read at all and
+    only the draft tensors are paged in, when consolidation copies them out.
+    """
+
+    try:
+        return torch.load(
+            path, map_location=map_location, weights_only=False, mmap=True
+        )
+    except (RuntimeError, TypeError, ValueError) as exc:
+        # Legacy non-zipfile checkpoints, a map_location that cannot be mapped,
+        # or a vendor torch.load wrapper that does not forward the argument.
+        logger.debug("mmap unavailable for %s (%s); reading eagerly", path, exc)
+        return torch.load(path, map_location=map_location, weights_only=False)
+
+
 def consolidate_draft_state(
     checkpoint_dir: str,
     shared_state: Dict[str, Any],
@@ -53,9 +74,7 @@ def consolidate_draft_state(
         merged.update(shared_draft)
     rank_pattern = os.path.join(checkpoint_dir, "training_state_rank*.pt")
     for rank_path in sorted(glob.glob(rank_pattern)):
-        rank_state = torch.load(
-            rank_path, map_location=map_location, weights_only=False
-        )
+        rank_state = _load_rank_payload(rank_path, map_location)
         rank_draft = rank_state.get("draft_state_dict")
         if not isinstance(rank_draft, dict):
             continue
@@ -72,7 +91,12 @@ def consolidate_draft_state(
                     f"{getattr(tensor, 'shape', None)}/"
                     f"{getattr(tensor, 'dtype', None)}"
                 )
-            merged.setdefault(name, tensor)
+            if name not in merged:
+                # Copy out of the mapping: these tensors outlive this function,
+                # and a lingering view would keep the whole rank file mapped.
+                merged[name] = (
+                    tensor.clone() if isinstance(tensor, torch.Tensor) else tensor
+                )
     if not merged:
         raise ValueError(
             f"checkpoint {checkpoint_dir} contains no draft_state_dict tensors"
