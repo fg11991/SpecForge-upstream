@@ -11,6 +11,7 @@ from unittest import mock
 import torch
 
 from scripts.prepare_hidden_states import (
+    DataSource,
     HiddenStatesGenerator,
     _generate_shared_vocab_mapping,
     _prepare_shared_vocab_mapping,
@@ -122,7 +123,10 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
             ) as build_dataset,
         ):
             build_processed_dataset(
-                args, mock.sentinel.dataset, mock.sentinel.tokenizer
+                args,
+                mock.sentinel.dataset,
+                mock.sentinel.tokenizer,
+                source=DataSource("data.jsonl", False),
             )
 
         self.assertEqual(32, build_dataset.call_args.kwargs["minimum_valid_tokens"])
@@ -157,6 +161,7 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
                 args,
                 mock.sentinel.dataset,
                 mock.sentinel.tokenizer,
+                source=DataSource("data.jsonl", False),
                 loss_mask_filter=loss_mask_filter,
             )
 
@@ -195,6 +200,7 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
                 args,
                 mock.sentinel.dataset,
                 mock.sentinel.tokenizer,
+                source=DataSource("data.jsonl", False),
                 loss_mask_filter=loss_mask_filter,
             )
 

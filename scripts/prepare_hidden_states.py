@@ -24,6 +24,25 @@ torchrun --nproc_per_node=2 \
     --draft-model-config configs/qwen3-8b-dspark.json
 
 
+Several files can go into one feature directory. Each is tokenized on its own:
+--data-path files are supervised on every assistant turn (on the last one only
+with --train-only-last-turn), --last-turn-data-path files on the last assistant
+turn only. The samples are then interleaved with --shuffle-seed (or kept in
+command-line order with --no-shuffle), and ${output_path}/dataset_manifest.json
+records the mix so a resumed run cannot silently reuse features of another one:
+torchrun --nproc_per_node=8 \
+    scripts/prepare_hidden_states.py \
+    --target-model-path deepseek-ai/DeepSeek-V4-Flash-DSpark \
+    --data-path ./cache/dataset/cot.jsonl ./cache/dataset/nocot.jsonl \
+    --last-turn-data-path ./cache/dataset/agent_traces.jsonl \
+    --output-path ./cache/hidden_states/dsv4-mix \
+    --chat-template deepseek-v4 \
+    --max-length 32768 \
+    --tp-size 8 \
+    --batch-size 8 \
+    --strategy dspark \
+    --draft-model-config configs/deepseek-v4-flash-dspark.json
+
 For pre-formatted data (with chat template already applied), add --is-preformatted:
 torchrun --nproc_per_node=2 \
     scripts/prepare_hidden_states.py \
@@ -55,7 +74,7 @@ from typing import Callable, Dict, List, Mapping, Optional
 
 import torch
 import torch.distributed as dist
-from datasets import Dataset
+from datasets import Dataset, concatenate_datasets
 from tqdm import tqdm
 from transformers import AutoConfig
 
@@ -135,7 +154,46 @@ def parse_args():
         help="Trust remote code when loading models",
     )
     data_group = parser.add_argument_group("data")
-    data_group.add_argument("--data-path", type=str, required=True)
+    data_group.add_argument(
+        "--data-path",
+        type=str,
+        nargs="+",
+        default=[],
+        help=(
+            "Conversation JSONL file(s) supervised on every assistant turn "
+            "(on the last one only with --train-only-last-turn)."
+        ),
+    )
+    data_group.add_argument(
+        "--last-turn-data-path",
+        type=str,
+        nargs="+",
+        default=[],
+        help=(
+            "Conversation JSONL file(s) supervised on the last assistant turn "
+            "only, e.g. agent trajectories whose earlier turns were written by "
+            "another model."
+        ),
+    )
+    data_group.add_argument(
+        "--train-only-last-turn",
+        action="store_true",
+        help="Supervise only the last assistant turn of the --data-path files too.",
+    )
+    data_group.add_argument(
+        "--shuffle-seed",
+        type=int,
+        default=42,
+        help="Seed for shuffling each file and for interleaving the files.",
+    )
+    data_group.add_argument(
+        "--no-shuffle",
+        action="store_true",
+        help=(
+            "Concatenate the files in command-line order instead of "
+            "interleaving them. Each file is still shuffled on its own."
+        ),
+    )
     data_group.add_argument("--max-length", type=int, default=2048)
     data_group.add_argument("--chat-template", type=str, default="llama3")
     data_group.add_argument(
@@ -260,7 +318,15 @@ def parse_args():
             "(FLA) at server init."
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.data_path and not args.last_turn_data_path:
+        parser.error("pass at least one of --data-path and --last-turn-data-path")
+    resolved = [
+        os.path.abspath(path) for path in args.data_path + args.last_turn_data_path
+    ]
+    if len(set(resolved)) != len(resolved):
+        parser.error("each data file may be passed only once")
+    return args
 
 
 def _resolve_draft_vocab_size(source: str) -> int:
@@ -293,32 +359,92 @@ def _resolve_draft_vocab_size(source: str) -> int:
     return value
 
 
+@dataclass(frozen=True)
+class DataSource:
+    """One conversation file and how its assistant turns are supervised."""
+
+    path: str
+    train_only_last_turn: bool
+
+
+# Parser behaviour the CLI cannot express. Bump a template's entry whenever its
+# rendering or loss mask changes, so processed-dataset caches written by the
+# old code are never reused.
+_RENDERER_VERSIONS = {"deepseek-v4": "official-encoder-v1"}
+
+DATASET_MANIFEST_NAME = "dataset_manifest.json"
+
+
+def resolve_data_sources(args: argparse.Namespace) -> List[DataSource]:
+    sources = [
+        DataSource(path, bool(args.train_only_last_turn)) for path in args.data_path
+    ]
+    sources += [DataSource(path, True) for path in args.last_turn_data_path]
+    return sources
+
+
+def _source_cache_key(args: argparse.Namespace, source: DataSource) -> str:
+    try:
+        stat = os.stat(source.path)
+        file_identity = [stat.st_size, stat.st_mtime_ns]
+    except FileNotFoundError:
+        file_identity = None
+    identity = {
+        "path": os.path.abspath(source.path),
+        "file": file_identity,
+        "train_only_last_turn": source.train_only_last_turn,
+        "max_length": args.max_length,
+        "chat_template": args.chat_template,
+        "renderer": _RENDERER_VERSIONS.get(args.chat_template),
+        "target_model_path": args.target_model_path,
+        "is_preformatted": args.is_preformatted,
+        "filter_candidate_samples": args.filter_candidate_samples,
+        "shuffle_seed": args.shuffle_seed,
+    }
+    return hashlib.md5(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+
+
+def load_source_dataset(args: argparse.Namespace, path: str) -> Dataset:
+    stat = os.stat(path)
+    return Dataset.from_generator(
+        generator=safe_conversations_generator,
+        # A string, not a list: from_generator shards list-valued kwargs
+        # across its num_proc workers.
+        gen_kwargs={
+            "file_path": path,
+            "file_identity": f"{stat.st_size}-{stat.st_mtime_ns}",
+        },
+        cache_dir=os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "cache",
+            "hf_dataset",
+        ),
+        num_proc=min(args.build_dataset_num_proc, 32),
+    )
+
+
 def build_processed_dataset(
     args: argparse.Namespace,
     dataset,
     tokenizer,
     *,
+    source: DataSource,
     loss_mask_filter: Optional[Callable[[object], bool]] = None,
 ):
-    """Tokenize the complete, un-sharded dataset once on rank 0."""
-
-    cache_params_string = (
-        f"{args.data_path}-{args.max_length}-{args.chat_template}-"
-        f"{args.target_model_path}-{args.num_samples}-{args.is_preformatted}-"
-        f"{args.filter_candidate_samples}"
-    )
-    cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
+    """Tokenize one complete, un-sharded source once on rank 0."""
 
     with rank_0_priority():
-        print_with_rank("Main process is building the dataset cache...")
+        print_with_rank(f"Main process is building the dataset cache for {source.path}...")
         return build_eagle3_dataset(
             dataset=dataset,
             tokenizer=tokenizer,
             chat_template=args.chat_template,
             max_length=args.max_length,
+            shuffle_seed=args.shuffle_seed,
             cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
-            cache_key=cache_key,
+            cache_key=_source_cache_key(args, source),
             is_preformatted=args.is_preformatted,
+            train_only_last_turn=source.train_only_last_turn,
             num_proc=args.build_dataset_num_proc,
             minimum_valid_tokens=args.minimum_valid_tokens,
             loss_mask_filter=loss_mask_filter,
@@ -326,6 +452,141 @@ def build_processed_dataset(
                 args.filter_candidate_samples if loss_mask_filter is not None else None
             ),
         )
+
+
+def mix_source_datasets(datasets, *, shuffle: bool, seed: int):
+    """Join processed sources into one deterministic sample order.
+
+    Every rank computes the same order, so the DP split and the on-disk sample
+    indices agree. A lone source is returned as is: it was already shuffled
+    with the same seed while it was built.
+    """
+
+    if len(datasets) == 1:
+        return datasets[0]
+    mixed = concatenate_datasets(list(datasets))
+    if shuffle:
+        mixed = mixed.shuffle(seed=seed)
+    mixed.set_format(type="torch")
+    return mixed
+
+
+def summarize_source(source: DataSource, *, rows: int, dataset) -> Dict[str, object]:
+    tokens = supervised_tokens = 0
+    for batch in dataset.iter(batch_size=1024):
+        for loss_mask in batch["loss_mask"]:
+            loss_mask = torch.as_tensor(loss_mask)
+            tokens += int(loss_mask.numel())
+            supervised_tokens += int(loss_mask.sum())
+    return {
+        "path": os.path.abspath(source.path),
+        "train_only_last_turn": source.train_only_last_turn,
+        "rows": rows,
+        "samples": len(dataset),
+        "tokens": tokens,
+        "supervised_tokens": supervised_tokens,
+    }
+
+
+def build_dataset_manifest(
+    args: argparse.Namespace,
+    source_stats: List[Dict[str, object]],
+    *,
+    total_samples: int,
+) -> Dict[str, object]:
+    """Describe everything that decides which sample lands at which index."""
+
+    return {
+        "version": 1,
+        "target_model_path": args.target_model_path,
+        "chat_template": args.chat_template,
+        "renderer": _RENDERER_VERSIONS.get(args.chat_template),
+        "max_length": args.max_length,
+        "is_preformatted": args.is_preformatted,
+        "minimum_valid_tokens": args.minimum_valid_tokens,
+        "filter_candidate_samples": args.filter_candidate_samples,
+        "num_samples": args.num_samples,
+        "shuffle": not args.no_shuffle,
+        "shuffle_seed": args.shuffle_seed,
+        "sources": source_stats,
+        "total_samples": total_samples,
+    }
+
+
+def print_dataset_mix(manifest: Mapping[str, object]) -> None:
+    order = (
+        f"interleaved with seed {manifest['shuffle_seed']}"
+        if manifest["shuffle"]
+        else "concatenated in order"
+    )
+    print(f"Dataset mix ({order}):")
+    for stats in manifest["sources"]:
+        mode = "last turn" if stats["train_only_last_turn"] else "all turns"
+        print(
+            f"  [{mode}] {stats['path']}: {stats['rows']} rows -> "
+            f"{stats['samples']} samples, {stats['supervised_tokens']}/"
+            f"{stats['tokens']} supervised tokens"
+        )
+    print(f"  total: {manifest['total_samples']} samples")
+
+
+def write_dataset_manifest(output_path: str, manifest: Mapping[str, object]) -> str:
+    """Record the dataset a feature directory holds, or refuse a different one.
+
+    Feature files are named by sample index and existing ones are skipped, so
+    resuming into a directory built from another mix would silently pair old
+    features with new indices.
+    """
+
+    manifest_path = os.path.join(output_path, DATASET_MANIFEST_NAME)
+    if os.path.exists(manifest_path):
+        with open(manifest_path, encoding="utf-8") as stream:
+            existing = json.load(stream)
+        if existing != manifest:
+            changed = sorted(
+                key
+                for key in set(existing) | set(manifest)
+                if existing.get(key) != manifest.get(key)
+            )
+            raise ValueError(
+                f"{manifest_path} describes a different dataset (differs in: "
+                f"{', '.join(changed)}); its features would be reused by index. "
+                "Use a fresh --output-path."
+            )
+        return manifest_path
+    if os.path.isdir(output_path) and any(
+        name.startswith("rows_") for name in os.listdir(output_path)
+    ):
+        raise ValueError(
+            f"{output_path} already holds features without a "
+            f"{DATASET_MANIFEST_NAME}, so its dataset cannot be verified. "
+            "Use a fresh --output-path."
+        )
+    os.makedirs(output_path, exist_ok=True)
+    temporary_path = f"{manifest_path}.{uuid.uuid4().hex}.tmp"
+    with open(temporary_path, "w", encoding="utf-8") as stream:
+        json.dump(manifest, stream, indent=2, ensure_ascii=False)
+    os.replace(temporary_path, manifest_path)
+    return manifest_path
+
+
+def _publish_dataset_manifest(
+    output_path: str, manifest: Optional[Mapping[str, object]]
+) -> None:
+    """Check and write the manifest on global rank 0; fail every rank alike."""
+
+    result = [None]
+    if dist.get_rank() == 0:
+        try:
+            result[0] = {"path": write_dataset_manifest(output_path, manifest)}
+        except BaseException as exc:
+            result[0] = {"error": f"{type(exc).__name__}: {exc}"}
+    dist.broadcast_object_list(result, src=0)
+    if result[0] is None or "error" in result[0]:
+        reason = "rank 0 did not publish a result"
+        if result[0] is not None:
+            reason = result[0]["error"]
+        raise RuntimeError(f"failed to publish the dataset manifest: {reason}")
 
 
 def _generate_shared_vocab_mapping(
@@ -1066,36 +1327,34 @@ def main():
         f"DP Size {dist.get_world_size(get_dp_group())}, TP Size {dist.get_world_size(get_tp_group())}"
     )
 
-    # Load complete dataset
-    assert os.path.exists(
-        args.data_path
-    ), f"Dataset path {args.data_path} does not exist"
-
-    with rank_0_priority():
-        print_with_rank("Loading/building dataset cache...")
-        dataset = Dataset.from_generator(
-            generator=safe_conversations_generator,
-            gen_kwargs={"file_path": args.data_path},
-            cache_dir=os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                "cache",
-                "hf_dataset",
-            ),
-            num_proc=min(args.build_dataset_num_proc, 32),
-        )
-    if args.num_samples is not None and capture_plan.loss_mask_filter is None:
-        dataset = dataset.select(range(args.num_samples))
-    # Tokenizer and cache key
+    # Tokenize every source with its own loss-mask mode, then mix them
+    sources = resolve_data_sources(args)
+    for source in sources:
+        if not os.path.exists(source.path):
+            raise FileNotFoundError(f"Dataset path {source.path} does not exist")
     tokenizer = load_tokenizer(
         args.target_model_path, trust_remote_code=args.trust_remote_code
     )
-    eagle3_dataset = build_processed_dataset(
-        args,
-        dataset,
-        tokenizer,
-        loss_mask_filter=capture_plan.loss_mask_filter,
+    built_sources = []
+    for source in sources:
+        with rank_0_priority():
+            print_with_rank(f"Loading/building dataset cache for {source.path}...")
+            raw_dataset = load_source_dataset(args, source.path)
+        processed = build_processed_dataset(
+            args,
+            raw_dataset,
+            tokenizer,
+            source=source,
+            loss_mask_filter=capture_plan.loss_mask_filter,
+        )
+        built_sources.append((source, len(raw_dataset), processed))
+    eagle3_dataset = mix_source_datasets(
+        [processed for _, _, processed in built_sources],
+        shuffle=not args.no_shuffle,
+        seed=args.shuffle_seed,
     )
-    if capture_plan.loss_mask_filter is not None and args.num_samples is not None:
+    # --num-samples caps the mixed dataset, so every source keeps its share.
+    if args.num_samples is not None:
         if (
             args.filter_candidate_samples is not None
             and len(eagle3_dataset) < args.num_samples
@@ -1103,7 +1362,7 @@ def main():
             raise ValueError(
                 f"only {len(eagle3_dataset)} samples satisfy "
                 f"{capture_plan.strategy} training eligibility in the "
-                f"{args.filter_candidate_samples} shuffled candidates; "
+                f"{args.filter_candidate_samples} shuffled candidates per file; "
                 f"requested --num-samples={args.num_samples}"
             )
         eagle3_dataset = eagle3_dataset.select(
@@ -1114,6 +1373,19 @@ def main():
             f"no samples satisfy {capture_plan.strategy} training eligibility"
         )
     print_with_rank(f"Dataset prepared with {len(eagle3_dataset)} samples.")
+
+    manifest = None
+    if dist.get_rank() == 0:
+        manifest = build_dataset_manifest(
+            args,
+            [
+                summarize_source(source, rows=rows, dataset=processed)
+                for source, rows, processed in built_sources
+            ],
+            total_samples=len(eagle3_dataset),
+        )
+        print_dataset_mix(manifest)
+    _publish_dataset_manifest(args.output_path, manifest)
 
     vocab_mapping_path = _prepare_shared_vocab_mapping(
         eagle3_dataset,
