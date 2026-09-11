@@ -43,7 +43,10 @@ class TemplateRegistryTest(unittest.TestCase):
         self.assertEqual(template.assistant_header, "<｜Assistant｜>")
         self.assertEqual(template.end_of_turn_token, "<｜end▁of▁sentence｜>")
         self.assertIsNone(template.system_prompt)
-        self.assertEqual(template.ignore_token, ["<think>", "</think>"])
+        # Rendering and the thinking delimiter belong to the official encoder.
+        self.assertEqual(template.parser_type, "deepseek-v4")
+        self.assertEqual(template.assistant_pattern_type, "deepseek-v4")
+        self.assertIsNone(template.ignore_token)
 
 
 if __name__ == "__main__":

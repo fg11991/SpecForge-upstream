@@ -278,9 +278,12 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
-# DeepSeek-V4 retains the User/Assistant/EOS boundary tokens, but its official
-# encoder owns the system prompt and inserts the thinking-mode delimiter. Keep
-# the delimiter outside supervised assistant content when it is present.
+# DeepSeek-V4 checkpoints ship no Jinja chat template: serving renders every
+# request with the official encoder (specforge/data/encoding_dsv4.py), and the
+# "deepseek-v4" parser renders training data with the same one. The encoder
+# closes each user turn with `<｜Assistant｜>` plus a prompt-side `<think>` or
+# `</think>`; supervision starts after that delimiter and keeps the `</think>`
+# the model emits after its own reasoning.
 TEMPLATE_REGISTRY.register(
     name="deepseek-v4",
     template=ChatTemplate(
@@ -288,7 +291,8 @@ TEMPLATE_REGISTRY.register(
         user_header="<｜User｜>",
         system_prompt=None,
         end_of_turn_token="<｜end▁of▁sentence｜>",
-        ignore_token=["<think>", "</think>"],
+        parser_type="deepseek-v4",
+        assistant_pattern_type="deepseek-v4",
     ),
 )
 

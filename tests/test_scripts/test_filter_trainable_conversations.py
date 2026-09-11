@@ -94,6 +94,24 @@ class TestFilterTrainableConversations(unittest.TestCase):
 
             self.assertEqual(json.loads(output_path.read_text()), row)
 
+    def test_accepts_the_openai_messages_key(self):
+        # Agent trajectories name the field "messages", as the loader allows.
+        row = {"id": "trace", "messages": [0, 1, 1, 0]}
+        with TemporaryDirectory() as temporary_directory:
+            input_path = Path(temporary_directory) / "input.jsonl"
+            output_path = Path(temporary_directory) / "filtered.jsonl"
+            input_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+            result = filter_trainable_conversations.filter_jsonl(
+                input_path,
+                output_path,
+                processing_stack=FAKE_STACK,
+                max_length=4,
+            )
+
+            self.assertEqual(result, (1, 0))
+            self.assertEqual(json.loads(output_path.read_text()), row)
+
     def test_refuses_to_overwrite_an_existing_output(self):
         with TemporaryDirectory() as temporary_directory:
             input_path = Path(temporary_directory) / "input.jsonl"

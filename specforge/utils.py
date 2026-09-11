@@ -192,12 +192,16 @@ def print_on_rank0(message):
         logger.info(message)
 
 
-def safe_conversations_generator(file_path):
+def safe_conversations_generator(file_path, file_identity=None):
     """
     Generator that:
-    1. Extracts the 'conversations' field.
+    1. Extracts the 'conversations' (or OpenAI-style 'messages') field.
     2. Preserves all original fields within each message.
     3. [Key step] Converts all list/dict-type field values to strings to resolve mixed-type conflicts (e.g., for Arrow compatibility).
+
+    ``file_identity`` is never read here. ``Dataset.from_generator`` keys its
+    Arrow cache on the generator kwargs, so callers pass the file's size and
+    mtime to re-read a file edited in place instead of serving a stale cache.
     """
     with open(file_path, "r", encoding="utf-8") as f:
         for i, line in enumerate(f):
@@ -206,7 +210,12 @@ def safe_conversations_generator(file_path):
                 continue
             try:
                 row = json.loads(line)
-                raw_convs = row.get("conversations", [])
+                # Agent trajectories use the OpenAI "messages" key instead.
+                raw_convs = (
+                    row["conversations"]
+                    if "conversations" in row
+                    else row.get("messages", [])
+                )
 
                 # 1. Ensure 'conversations' is a list
                 if not isinstance(raw_convs, list):

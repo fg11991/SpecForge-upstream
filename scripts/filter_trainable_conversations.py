@@ -141,7 +141,12 @@ def _preprocess_row(
     train_only_last_turn: bool,
 ) -> list[int]:
     tokenizer, template, preprocess_conversations = processing_stack
-    source_field = "text" if is_preformatted else "conversations"
+    if is_preformatted:
+        source_field = "text"
+    else:
+        # Agent trajectories use the OpenAI "messages" key; the offline
+        # loader accepts either spelling, so the filter must too.
+        source_field = "conversations" if "conversations" in row else "messages"
     if source_field not in row:
         raise ValueError(f"line {line_number}: missing required {source_field!r} field")
 
@@ -151,10 +156,10 @@ def _preprocess_row(
             raise ValueError(f"line {line_number}: 'text' must be a non-empty string")
     elif not isinstance(source, list) or not source:
         raise ValueError(
-            f"line {line_number}: 'conversations' must be a non-empty list"
+            f"line {line_number}: {source_field!r} must be a non-empty list"
         )
 
-    reserved_fields = {"id", "conversations", "text", "tools"}
+    reserved_fields = {"id", "conversations", "messages", "text", "tools"}
     template_kwargs = {
         key: [value] for key, value in row.items() if key not in reserved_fields
     }

@@ -7,9 +7,16 @@ from typing import Dict, List, Tuple
 import torch
 from transformers import PreTrainedTokenizer
 
+from . import encoding_dsv4
 from .template import ChatTemplate
 
-__all__ = ["GeneralParser", "GLMParser", "HarmonyParser", "ThinkingParser"]
+__all__ = [
+    "DeepSeekV4Parser",
+    "GeneralParser",
+    "GLMParser",
+    "HarmonyParser",
+    "ThinkingParser",
+]
 
 
 class Parser(ABC):
@@ -168,6 +175,16 @@ class GeneralParser(Parser):
                 + terminators
                 + "|$))"
             )
+        elif chat_template.assistant_pattern_type == "deepseek-v4":
+            # The prompt-side thinking delimiter belongs to the template, not
+            # to the model's output, so it stays outside the captured span.
+            self.assistant_pattern = (
+                re.escape(self.assistant_message_separator)
+                + r"(?:<think>|</think>)?"
+                + r"([\s\S]*?(?:"
+                + re.escape(self.chat_template.end_of_turn_token)
+                + "|$))"
+            )
         elif chat_template.assistant_pattern_type == "glm":
             self.assistant_pattern = (
                 re.escape(self.assistant_message_separator)
@@ -265,6 +282,17 @@ class GeneralParser(Parser):
                         parts.append(f"{assistant_header}{msg['content']}{end_of_turn}")
                 conversation = "".join(parts)
 
+        return self._encode_with_loss_mask(
+            conversation, max_length, train_only_last_turn
+        )
+
+    def _encode_with_loss_mask(
+        self,
+        conversation: str,
+        max_length: int,
+        train_only_last_turn: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Tokenize rendered text and supervise the assistant spans in it."""
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.unk_token_id
 
@@ -513,3 +541,119 @@ class GLMParser(GeneralParser):
     def apply_chat_template(self, messages, tool, **kwargs) -> str:
         kwargs.setdefault("enable_thinking", False)
         return super().apply_chat_template(messages, tool, **kwargs)
+
+
+class DeepSeekV4Parser(GeneralParser):
+    """Render DeepSeek-V4 conversations with the official message encoder.
+
+    DeepSeek-V4 checkpoints ship no Jinja chat template, so the tokenizer
+    cannot render tool schemas, DSML tool calls, tool results or reasoning.
+    Serving encodes every request with ``encoding_dsv4.encode_messages``;
+    rendering training data with the same encoder keeps the captured target
+    states on the distribution the target sees at inference.
+
+    A conversation is encoded in thinking mode when any assistant turn carries
+    ``reasoning_content`` and in chat mode otherwise. The encoder then decides
+    which reasoning survives: every turn's when tools are declared, otherwise
+    only the turns after the last user message.
+    """
+
+    _roles = ("system", "user", "assistant", "tool")
+
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        chat_template: ChatTemplate,
+    ):
+        super().__init__(tokenizer, chat_template)
+        self.standard_keys = {
+            "role",
+            "content",
+            "reasoning_content",
+            "tool_calls",
+            "tool_call_id",
+            "tools",
+        }
+
+    def render(self, conversation: "Conversation", tool: List[Dict] = ()) -> str:
+        messages = []
+        seen_user = False
+        for raw_message in conversation:
+            message = self._sanitize_message(self._normalize_message(raw_message))
+            # Arrow fills keys a message lacks with None; the encoder expects
+            # them absent.
+            message = {k: v for k, v in message.items() if v is not None}
+            role = message["role"]
+            if role not in self._roles:
+                warnings.warn(
+                    f"Unsupported DeepSeek-V4 role {role!r}. Conversation truncated."
+                )
+                break
+            if role == "system":
+                if messages:
+                    warnings.warn(
+                        "A 'system' message is only supported as the first "
+                        "message. Conversation truncated."
+                    )
+                    break
+            elif role == "user":
+                seen_user = True
+            elif not seen_user:
+                warnings.warn(
+                    f"Dropping leading '{role}' message before the first user turn."
+                )
+                continue
+            else:
+                allowed = ("user", "tool") if role == "assistant" else ("assistant", "tool")
+                previous = messages[-1]["role"]
+                if previous not in allowed:
+                    warnings.warn(
+                        f"A '{role}' message must follow {' or '.join(allowed)}, "
+                        f"but was preceded by '{previous}'. Conversation truncated."
+                    )
+                    break
+            if isinstance(message.get("tools"), str):
+                message["tools"] = json.loads(message["tools"])
+            if not message.get("reasoning_content"):
+                message.pop("reasoning_content", None)
+            messages.append(message)
+
+        # Row-level tools go where serving puts request tools: on a leading
+        # system message, inserted empty when the conversation has none.
+        if tool:
+            if not messages or messages[0]["role"] != "system":
+                messages.insert(0, {"role": "system", "content": ""})
+            if messages[0].get("tools"):
+                warnings.warn(
+                    "Both the row and its system message declare tools; "
+                    "keeping the system message's."
+                )
+            else:
+                messages[0]["tools"] = list(tool)
+
+        thinking_mode = (
+            "thinking"
+            if any(
+                message["role"] == "assistant" and message.get("reasoning_content")
+                for message in messages
+            )
+            else "chat"
+        )
+        return encoding_dsv4.encode_messages(messages, thinking_mode=thinking_mode)
+
+    def parse(
+        self,
+        conversation: "Conversation",
+        max_length: int,
+        preformatted: bool = False,
+        train_only_last_turn: bool = False,
+        tool: List[Dict] = [],
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Leftover dataset columns arrive as kwargs; the encoder takes none.
+        del kwargs
+        if not preformatted:
+            conversation = self.render(conversation, tool)
+        return self._encode_with_loss_mask(
+            conversation, max_length, train_only_last_turn
+        )
